@@ -1,0 +1,5 @@
+# Optional: copy to jc.local.toml and choose your own lawful local image.
+# Make and use the image only as permitted by applicable law. See LEGAL.md.
+# European release SLES-02201, raw MODE2/2352 .bin.
+disc_image = 'X:\path\to\Jade Cocoon - Story of the Tamamayu (Europe).bin'
+cache_dir = 'cache'

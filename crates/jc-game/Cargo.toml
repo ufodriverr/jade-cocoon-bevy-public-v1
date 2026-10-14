@@ -1,0 +1,13 @@
+[package]
+name = "jc-game"
+description = "Jade Cocoon reimplemented on Bevy, playing from the user's own disc image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+jc-disc = { workspace = true }
+jc-formats = { workspace = true }
+rfd = { workspace = true }

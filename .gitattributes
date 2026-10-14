@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+# Preserve upstream licence and notice files verbatim.
+LICENSE -text -whitespace
+licenses/** -text -whitespace

@@ -1,0 +1,4 @@
+[toolchain]
+# MSVC is the supported Windows target; it needs the Visual Studio "Desktop development with
+# C++" workload including the Windows SDK. (The GNU target fails here: no dlltool.)
+channel = "stable-x86_64-pc-windows-msvc"

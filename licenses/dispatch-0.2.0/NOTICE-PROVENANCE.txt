@@ -1,0 +1,6 @@
+Upstream package: dispatch 0.2.0
+Repository: https://github.com/SSheldon/rust-dispatch
+Declared licence: MIT
+This package omitted a standalone licence file. The exact published manifest
+and standard licence text or same-project notices are retained here.
+No copyright year or copyright holder has been invented. See NOTICE-ORIGINS.json.

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/jc-disc", "crates/jc-formats", "crates/jc-game"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+bevy = "0.19.1"
+jc-disc = { path = "crates/jc-disc" }
+jc-formats = { path = "crates/jc-formats" }
+png = "0.18"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# Bevy is unusably slow unoptimized; keep our own crates quick to rebuild.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+# Avoid embedding local developer paths in debug information.
+debug = false
+strip = "debuginfo"
