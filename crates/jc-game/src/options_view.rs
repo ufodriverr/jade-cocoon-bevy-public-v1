@@ -2,11 +2,12 @@
 use bevy::prelude::*;
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
 use jc_formats::menu::{self, Frames, Rect, Style, sign};
-use jc_formats::name::{self, LegendPiece};
+use jc_formats::name;
 use jc_formats::notice;
 use jc_formats::options_panel;
 use jc_formats::options_screen::{self, OptionsScreen, Passed, Settings};
 use jc_formats::pad::Pad;
+use jc_formats::player_menu::SOUND_CONFIRM;
 use jc_formats::player_panel::{self, Drawn};
 use jc_formats::text::{self, Font, Fonts};
 use jc_formats::tim;
@@ -14,9 +15,32 @@ use jc_formats::window;
 
 use crate::music::Music;
 use crate::name_entry::{Picture, SCREEN, WHOLE, blend, blit};
+use crate::pc_settings::{self, PcSettings};
 use crate::place_map::{lit, picture};
+use crate::pointer::{self, Aim, Mouse};
+use crate::prefs::Prefs;
+use crate::prompts::{self, Laid};
 
 type Failure = Box<dyn std::error::Error>;
+
+/// The line of the first list that is "PC Settings" in place of "Vibration".
+pub(crate) const PC_LINE: i16 = options_screen::VIBRATION - 1;
+/// Its words, and its line of help.
+const PC_WORDS: &str = "PC Settings";
+const PC_HELP: &str = "Screen, sound, game and keys of the PC.";
+
+/// The PC Settings with what they show and the scroll signs to draw them with.
+#[derive(Clone, Copy)]
+pub(crate) struct Pc<'a> {
+    pub(crate) settings: &'a PcSettings,
+    pub(crate) prefs: &'a Prefs,
+    /// The scroll sign in every window colour (`scroll_signs`).
+    pub(crate) signs: &'a [Picture],
+}
+
+/// The colour of the words of "PC Settings", near the green of the game's pictures of
+/// words on the menus' lines.
+const PC_INK: [u8; 3] = [150, 200, 120];
 
 /// Whether a pixel lies in a drawing area.
 pub(crate) fn inside(clip: Rect, x: i16, y: i16) -> bool {
@@ -44,7 +68,8 @@ pub(crate) fn blit_lit(
     }
 }
 
-/// A text in a font, from a picture of the font's image.
+/// A text in a font, from a picture of the font's image. The signs of the pad's buttons
+/// in it are the keys or the pad's buttons of the prompts' style (`prompts.rs`).
 pub(crate) fn glyphs(
     screen: &mut [u8],
     font: &Font,
@@ -54,7 +79,12 @@ pub(crate) fn glyphs(
     clip: Rect,
 ) {
     let cell = (usize::from(font.cell.0), usize::from(font.cell.1));
+    let signs = prompts::now();
     for glyph in font.glyphs(&font.codes(units), at) {
+        if let Some((sign, at)) = prompts::in_text(signs.as_deref(), font, glyph.code, glyph.at) {
+            prompts::put(screen, &sign, at, clip);
+            continue;
+        }
         if let Some(from) = glyph.cell {
             let from = (usize::from(from.0), usize::from(from.1));
             blit(screen, picture, from, cell, glyph.at, clip);
@@ -73,7 +103,12 @@ pub(crate) fn glyphs_lit(
     colour: [u8; 3],
 ) {
     let cell = (usize::from(font.cell.0), usize::from(font.cell.1));
+    let signs = prompts::now();
     for glyph in font.glyphs(&font.codes(units), at) {
+        if let Some((sign, at)) = prompts::in_text(signs.as_deref(), font, glyph.code, glyph.at) {
+            prompts::put(screen, &sign, at, WHOLE);
+            continue;
+        }
         let Some(from) = glyph.cell else {
             continue;
         };
@@ -211,6 +246,10 @@ pub(crate) struct Look {
 }
 
 impl Look {
+    pub(crate) fn lines(&self) -> &options_panel::Lines {
+        &self.lines
+    }
+
     /// Reads them from the screen's file. A word of the legend lies in that file or in
     /// the executable.
     pub(crate) fn read(file: &[u8], exe: &Executable) -> Result<Self, Failure> {
@@ -281,8 +320,19 @@ impl Parts<'_> {
         glyphs(screen, self.font, self.font_picture, units, at, clip);
     }
 
+    /// A text of the build as units of the font of the texts.
+    pub(crate) fn letters(&self, said: &str) -> Vec<u16> {
+        pc_settings::letters(self.font, said)
+    }
+
+    /// How wide a text of the build is in the font of the texts.
+    pub(crate) fn width_of(&self, said: &str) -> i16 {
+        self.font.length(&self.font.codes(&self.letters(said)))
+    }
+
     /// The line of help of a list in a window colour: its frame, added last, lies under
-    /// the signs and the words.
+    /// the signs and the words. The signs are the keys or the pad's buttons of the
+    /// prompts' style (`prompts.rs`).
     pub(crate) fn legend(&self, screen: &mut [u8], colour: i16, pairs: &[(usize, Vec<u16>)]) {
         let legend = name::legend(colour);
         self.frame(screen, legend.rect, legend.style, 0);
@@ -290,10 +340,11 @@ impl Parts<'_> {
             let sprite = self.sprites.get(number)?;
             Some((sprite.wide as i16, sprite.high as i16))
         };
-        for piece in name::legend_pieces(pairs, self.font, sizes).unwrap_or_default() {
+        for piece in prompts::legend(pairs, self.font, sizes, false) {
             match piece {
-                LegendPiece::Sign { sprite, at } => self.sprite(screen, sprite, at, WHOLE),
-                LegendPiece::Word { units, at } => self.text(screen, &units, at, WHOLE),
+                Laid::Sprite { sprite, at } => self.sprite(screen, sprite, at, WHOLE),
+                Laid::Glyph { glyph, at } => prompts::put(screen, &glyph, at, WHOLE),
+                Laid::Word { units, at } => self.text(screen, &units, at, WHOLE),
             }
         }
     }
@@ -354,19 +405,45 @@ impl Parts<'_> {
     }
 
     /// What the options screen draws in a pass, over the wall: its pieces from
-    /// underneath, and its legend unless a refusal is up.
+    /// underneath, and its legend unless a refusal is up. The first list has "PC
+    /// Settings" on the line of "Vibration"; while the PC Settings are up they draw
+    /// themselves in place of the options.
     pub(crate) fn options(
         &self,
         screen: &mut [u8],
         look: &Look,
-        options: &OptionsScreen,
-        settings: &Settings,
+        (options, settings): (&OptionsScreen, &Settings),
         time: u32,
+        pc: Pc,
     ) {
         let colour = settings.colour as i16;
+        if pc.settings.is_open() {
+            let shown = (colour, pc.signs, time);
+            pc.settings.paint(self, screen, pc.prefs, shown);
+            return;
+        }
         let width = |number: usize| self.width(number);
+        let first = options.page == options_screen::FIRST;
+        let pc_line = (look.lines.first.get(PC_LINE as usize))
+            .and_then(|line| menu::bounds(line.iter().map(|piece| piece.rect)));
         for drawn in options_panel::drawn(options, settings, &look.lines, time, width) {
-            self.put(screen, look, colour, drawn);
+            match drawn {
+                // The words of the line of "PC Settings" in place of the picture of
+                // "Vibration", and its own line of help.
+                Drawn::Sprite { at, .. }
+                    if first && pc_line.is_some_and(|rect| pointer::inside(rect, at)) =>
+                {
+                    let Some(rect) = pc_line else { continue };
+                    let said = self.letters(PC_WORDS);
+                    let wide = self.width_of(PC_WORDS);
+                    let place = (rect.x + (rect.w - wide) / 2, rect.y + (rect.h - 12) / 2);
+                    glyphs_lit(screen, self.font, self.font_picture, &said, place, PC_INK);
+                }
+                Drawn::OptionsHelp { page: 0, line, at } if line == PC_LINE as usize => {
+                    self.text(screen, &self.letters(PC_HELP), at, WHOLE);
+                }
+                drawn => self.put(screen, look, colour, drawn),
+            }
         }
         if options.up && options.refusal == 0 {
             self.legend(screen, colour, &look.legend);
@@ -374,16 +451,70 @@ impl Parts<'_> {
     }
 }
 
-/// One pass of the options screen's task on the settings: its sounds are played and
-/// what it changed is logged under the caller's name.
+/// Once a frame: the mouse over the options screen, at a pixel of the screen
+/// (`pointer.rs`), or over the PC Settings while they are up.
+pub(crate) fn look(
+    (aim, pc): (&mut Aim<options_panel::Spot>, &mut PcSettings),
+    mouse: &Mouse,
+    at: Option<(i16, i16)>,
+    options: &OptionsScreen,
+    lines: &options_panel::Lines,
+) {
+    if pc.is_open() {
+        aim.forget();
+        pc.look(mouse, at);
+        return;
+    }
+    let spots = options_panel::spots(options, lines);
+    aim.look(mouse, pointer::row_under(spots, at));
+}
+
+/// One pass of the options screen's task on the settings: the mouse steers its cursor,
+/// its sounds are played and what it changed is logged under the caller's name. While
+/// the PC Settings are up the pass is theirs, on the player's settings; a confirm on the
+/// line of "PC Settings" opens them.
 pub(crate) fn pass(
     who: &str,
     passes: u32,
-    options: &mut OptionsScreen,
+    (options, aim): (&mut OptionsScreen, &mut Aim<options_panel::Spot>),
     settings: &mut Settings,
     pad: &Pad,
-    music: &mut Music,
+    (music, pc, prefs): (&mut Music, &mut PcSettings, &mut Prefs),
 ) -> Passed {
+    if pc.is_open() {
+        let passed = pc.pass(pad, prefs);
+        for &sound in &passed.sounds {
+            music.sound(sound.into());
+        }
+        if passed.closed {
+            info!("{who}: pass {passes}: the PC Settings are closed, the options are back");
+        }
+        return Passed::default();
+    }
+    let mut pad = *pad;
+    match options.up && options.refusal == 0 {
+        true => {
+            let here = options_panel::here(options, settings);
+            aim.steer(&mut pad, here, |to| options_panel::way(options, here, to));
+        }
+        false => aim.forget(),
+    }
+    let pad = &pad;
+    let on_pc_line = options.up
+        && options.refusal == 0
+        && !options.picking
+        && options.page == options_screen::FIRST
+        && options.cursor.at == PC_LINE
+        && options.cursor.columns == 1;
+    if on_pc_line && menu::confirmed(pad) {
+        music.sound(SOUND_CONFIRM.into());
+        info!("{who}: pass {passes}: the options: PC Settings");
+        pc.open(pc_settings::Page::default());
+        return Passed {
+            sounds: vec![SOUND_CONFIRM],
+            ..Passed::default()
+        };
+    }
     let place = |options: &OptionsScreen| {
         let at = (options.page, options.cursor.at);
         (at, options.picking, options.refusal, options.bytes)
@@ -426,17 +557,22 @@ pub(crate) fn pass(
     pass
 }
 
-/// The options screen for a caller without a screen of the menus: the parts and the
-/// look, read from the disc.
+/// The options screen for a caller without a screen of the menus: the parts, the look
+/// and the scroll signs of the PC Settings, read from the disc.
 pub(crate) struct View {
     sprites: Vec<Picture>,
     frames: Frames,
     font: Font,
     font_picture: Picture,
     look: Look,
+    signs: Vec<Picture>,
 }
 
 impl View {
+    pub(crate) fn lines(&self) -> &options_panel::Lines {
+        self.look.lines()
+    }
+
     pub(crate) fn read() -> Result<Self, Failure> {
         let config = LocalConfig::load()?;
         let mut disc = DiscImage::open(&config.disc_image)?;
@@ -457,21 +593,25 @@ impl View {
             .collect::<Result<Vec<_>, _>>()?;
         let file = archive.read(&mut disc, options_screen::OPTIONS_FILE)?;
         let look = Look::read(&file, &exe)?;
+        let signs = scroll_signs(&exe, &font_set)?;
         Ok(Self {
             sprites,
             frames,
             font,
             font_picture,
             look,
+            signs,
         })
     }
 
-    /// The screen of a pass, four bytes a pixel: the wall and the options over it.
+    /// The screen of a pass, four bytes a pixel: the wall and the options over it, or
+    /// the PC Settings while they are up.
     pub(crate) fn screen(
         &self,
         options: &OptionsScreen,
         settings: &Settings,
         time: u32,
+        (pc, prefs): (&PcSettings, &Prefs),
     ) -> Vec<u8> {
         let mut screen = [0, 0, 0, 255].repeat(SCREEN.0 * SCREEN.1);
         let parts = Parts {
@@ -481,7 +621,12 @@ impl View {
             font_picture: &self.font_picture,
         };
         parts.wall(&mut screen);
-        parts.options(&mut screen, &self.look, options, settings, time);
+        let pc = Pc {
+            settings: pc,
+            prefs,
+            signs: &self.signs,
+        };
+        parts.options(&mut screen, &self.look, (options, settings), time, pc);
         screen
     }
 }

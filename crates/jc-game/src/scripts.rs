@@ -43,6 +43,7 @@ use jc_formats::items;
 use jc_formats::leave::{self, MapTrigger, Waiting};
 use jc_formats::leave_forest::{self, Leaving};
 use jc_formats::lock::{self, Lock, Locking};
+use jc_formats::menu::Rect;
 use jc_formats::mesh::MeshBlock;
 use jc_formats::message::{self, Group};
 use jc_formats::mover;
@@ -76,8 +77,12 @@ use jc_formats::warp::{self, Warping, Warps};
 use jc_formats::window::{self, Window};
 
 use crate::field::FieldScreen;
+use crate::pointer::Aim;
 use crate::shown::Standing;
 use crate::walker::Walker;
+
+mod versus;
+pub use versus::{VersusMoment, VersusSetup, VersusShown, VersusSpot, dice};
 
 /// A place and an angle about the upright axis.
 type Placed = ([i32; 3], i16);
@@ -95,6 +100,44 @@ pub struct Scripts {
     /// Every task with the game frame it ended or stopped in, none while it runs.
     tasks: Vec<(Task, Option<u32>)>,
     room: Room,
+}
+
+/// What a press of the confirm button would do where the player stands
+/// ([`Scripts::confirm_takes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Takes {
+    /// A talk: the task of this number waits for it.
+    Talk(i32),
+    /// A gate of the forests (`jc_formats::gate`).
+    Gate,
+    /// A bank of a passage, a gap to cross (`jc_formats::passage`).
+    Passage,
+    /// A lock (`jc_formats::lock`).
+    Lock,
+    /// A door (`jc_formats::door`).
+    Door,
+    /// A thing to be searched (`jc_formats::search`).
+    Search,
+    /// The object of the memory card, the light to save at (`jc_formats::card`).
+    SaveLight,
+    /// A spot that waits for the press (`jc_formats::spot`).
+    Spot,
+    /// A switch (`jc_formats::switch`).
+    Switch,
+}
+
+impl Takes {
+    /// The objects in the order [`Scripts::call_objects`] tells them.
+    const OBJECTS: [Takes; 8] = [
+        Takes::Gate,
+        Takes::Passage,
+        Takes::Lock,
+        Takes::Door,
+        Takes::Search,
+        Takes::SaveLight,
+        Takes::Spot,
+        Takes::Switch,
+    ];
 }
 
 /// What limits the zoom while no point has been projected yet: nothing.
@@ -212,6 +255,10 @@ struct Room {
     /// The other buttons a player holds in this game frame: the directions that move
     /// the cursor of a question, and the triangle.
     keys: u16,
+    /// The answer of a question the mouse steers the cursor to (`pointer.rs`), and the
+    /// spot of the menu of a fight.
+    aim: Aim<i16>,
+    fight_aim: Aim<fight_menu_panel::Spot>,
     /// The text font and the groups of the room's text, for the windows of the messages.
     font: Font,
     groups: Vec<Group>,
@@ -221,6 +268,9 @@ struct Room {
     pad: Pad,
     /// Nobody is at the pad: the confirm goes down whenever a window stands.
     confirms: bool,
+    /// The build skips the scene (`skip.rs`, C3): the confirm goes down whenever a
+    /// window stands that is no question, as with nobody at the pad.
+    skipping: bool,
     /// The answers a run with nobody at the pad gives to the questions of the room, in
     /// their order (`--answer-in`), and the questions asked so far.
     answers: Vec<i16>,
@@ -261,6 +311,11 @@ struct Room {
     lesson: Option<u32>,
     fight_place: Option<FightPlace>,
     fight: Option<Lasting>,
+    /// A fight of two players the view has handed over (`versus.rs`), which the next game
+    /// frame puts on screen in place of whatever fight is there.
+    versus_start: Option<Box<VersusSetup>>,
+    /// The duel as the session left it while that fight was still to come.
+    versus_later: Option<Box<versus::Later>>,
     creature_moves: Vec<Vec<command::Command>>,
     own_moves: BTreeMap<u32, Vec<Vec<command::Command>>>,
     fight_asks: Option<(u32, u32)>,
@@ -456,6 +511,9 @@ pub struct FightMenu<'a> {
     pub hud: Vec<fight_hud::Drawn>,
     pub names: [Option<[u8; jc_formats::name::LETTERS]>; SLOTS],
     pub game_frame: u32,
+    /// The menu is a minion's of a fight of two players (`versus.rs`): its sixth cell
+    /// is "Item".
+    pub duel: bool,
 }
 
 /// The item at each place of the player's list of items; `None` for a free place.
@@ -634,11 +692,26 @@ impl FightPlace {
     /// The place of the room with this number; a room without a number is in no list of
     /// the places and fights in place 0, as a room in no list does.
     fn read(disc: &mut DiscImage<File>, exe: &Executable, room: Option<u16>) -> Option<Self> {
+        Self::of(disc, exe, |places| {
+            room.map_or(0, |room| places.of_room(room))
+        })
+    }
+
+    pub fn of_place(disc: &mut DiscImage<File>, exe: &Executable, place: usize) -> Option<Self> {
+        Self::of(disc, exe, |_| place)
+    }
+
+    /// The place `pick` names in the table of the places.
+    fn of(
+        disc: &mut DiscImage<File>,
+        exe: &Executable,
+        pick: impl FnOnce(&Places) -> usize,
+    ) -> Option<Self> {
         let archive = Archive::open(disc).ok()?;
         let battle = archive.read(disc, arena::PLACES_FILE).ok()?;
         let engine = archive.read(disc, arena::ROOMS_FILE).ok()?;
         let places = Places::from_files(&battle, &engine).ok()?;
-        let place = places.get(room.map_or(0, |room| places.of_room(room)))?;
+        let place = places.get(pick(&places))?;
         let package = archive.read(disc, place.file as usize).ok()?;
         Some(Self {
             package: Package::parse(&package).ok()?,
@@ -707,6 +780,9 @@ struct Lasting {
     /// 0 outside a fight of a master and his creature, 1 in one (`0x800A2A44`).
     /// Stand-in: the swap is not kept, so the master is always the one in front.
     master: u8,
+    /// A fight of two players (`versus.rs`): the duel the session decides, which the
+    /// picture follows in place of the rules of the story.
+    versus: Option<Box<versus::Match>>,
 }
 
 /// The creature that roams whose touch started a fight.
@@ -1295,6 +1371,15 @@ impl Room {
             false => self.named.get(&text).copied(),
         }
     }
+}
+
+/// Whether a script of the object lists of `package`, archive file `file`, holds a fight
+/// of a script, the lessons' package left out ([`Scripts::holds_story_fight`]).
+pub fn holds_story_fight(package: &ScenePackage, file: usize) -> bool {
+    file != scene::LESSONS_FILE
+        && (package.scripts().iter()).any(|script| {
+            (script.commands.iter()).any(|command| command.code == scene::COMMAND_FIGHT)
+        })
 }
 
 /// A number for a new script task: behind every task's and behind those the scripts of
@@ -2112,11 +2197,14 @@ impl Scripts {
                 again: false,
                 confirm: false,
                 keys: 0,
+                aim: Aim::default(),
+                fight_aim: Aim::default(),
                 font,
                 groups,
                 named,
                 pad: Pad::default(),
                 confirms,
+                skipping: false,
                 answers: Vec::new(),
                 asked: 0,
                 spawner: package.show_routines().map(|routines| routines.spawner),
@@ -2148,6 +2236,8 @@ impl Scripts {
                 lesson: None,
                 fight_place,
                 fight: None,
+                versus_start: None,
+                versus_later: None,
                 creature_moves,
                 own_moves,
                 fight_asks,
@@ -2274,7 +2364,10 @@ impl Scripts {
         // A fight that waits for a command takes the confirm for one.
         let asks = (self.room.fight.as_ref()).is_some_and(|fight| fight.asks.is_some());
         let stands = stands || asks;
-        let by_itself = self.room.confirms && stands && self.room.pad.held == 0;
+        // A skip of the scene confirms the same way, but never a question
+        // (`skip.rs`): the player answers it.
+        let skips = self.room.skipping && !self.asks();
+        let by_itself = (self.room.confirms || skips) && stands && self.room.pad.held == 0;
         // A question of a run nobody plays: the cursor goes down, every other game
         // frame, to the answer the run names for it, and the confirm waits for that.
         let pointed = (self.tasks.iter())
@@ -2302,6 +2395,12 @@ impl Scripts {
         self.room
             .pad
             .read(held | pressed, Repeat::of(2), game_frame);
+        match self.answer_lines() {
+            Some((at, _)) => (self.room.aim).steer(&mut self.room.pad, at, |line| {
+                jc_formats::menu::way(1, at, line)
+            }),
+            None => self.room.aim.forget(),
+        }
         if self.room.made_for != Some(view) {
             let before = self.room.made_for.replace(view).map(|before| before as u32);
             for &(number, address, views) in &self.room.by_view {
@@ -2345,6 +2444,30 @@ impl Scripts {
                 view,
             };
             engine.pass_touch();
+        }
+        // A fight of two players is the room's own too; one the view has handed over
+        // comes on screen first.
+        let starts = self.room.versus_start.take();
+        let versus = (self.room.fight.as_ref()).is_some_and(|fight| fight.versus.is_some());
+        if starts.is_some() || versus {
+            let mut engine = Running {
+                room: &mut self.room,
+                actors: &mut *actors,
+                player: player.as_deref_mut(),
+                package: &package,
+                file: self.number,
+                camera,
+                distance,
+                view,
+            };
+            if let Some(setup) = starts {
+                engine.enter_versus(*setup);
+            }
+            engine.pass_versus();
+            if let Some(later) = self.room.versus_later.take() {
+                let versus::Later(duel, step, series) = *later;
+                versus::update(&mut self.room, &duel, step, series);
+            }
         }
         for (task, over) in &mut self.tasks {
             if over.is_some() {
@@ -3432,6 +3555,7 @@ impl Scripts {
                     for thing in things {
                         let sound = notice::ending_sound(noticed.way, thing.kind, thing.number);
                         (room.music).extend(sound.map(|sound| (game_frame, Heard::Sound(sound))));
+                        let before = room.carried.keeping.money();
                         (room.carried.keeping).notice_ends(
                             noticed.way,
                             thing.kind,
@@ -3439,6 +3563,9 @@ impl Scripts {
                             thing.count,
                             room.carried.worn,
                         );
+                        // `money_multiplier` (`assist.rs`) for the money a notice gives.
+                        let times = crate::assist::now().money;
+                        crate::assist::given_money(&mut room.carried.keeping, before, times, None);
                     }
                     info!(
                         "game frame {game_frame}: the notice of script {number} ends and does \
@@ -3517,6 +3644,32 @@ impl Scripts {
 
     /// The buttons besides the confirm that a player holds in the game frame to come:
     /// the directions, which move the cursor of a question, and the triangle.
+    /// The line of the cursor among the answers of a question that stands open, and
+    /// the places of the answers.
+    fn answer_lines(&self) -> Option<(i16, Vec<Rect>)> {
+        (self.tasks.iter())
+            .find_map(|(task, _)| task.speech.window.as_ref().and_then(Window::answer_lines))
+    }
+
+    /// Once a frame: the mouse over the spot of the menu of a fight under it.
+    pub fn point_at_fight(
+        &mut self,
+        mouse: &crate::pointer::Mouse,
+        under: Option<fight_menu_panel::Spot>,
+    ) {
+        self.room.fight_aim.look(mouse, under);
+    }
+
+    /// Once a frame: the mouse over the answers of a question, at a pixel of the
+    /// screen.
+    pub fn point(&mut self, mouse: &crate::pointer::Mouse, at: Option<(i16, i16)>) {
+        // Without a question the wheel stays the pad's.
+        if let Some((_, lines)) = self.answer_lines() {
+            let under = crate::pointer::row_under((0..).zip(lines), at);
+            self.room.aim.look(mouse, under);
+        }
+    }
+
     pub fn hold(&mut self, keys: u16) {
         // The circle and L1 are here for the field task's question of the menu alone.
         let read = pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT | pad::TRIANGLE;
@@ -3572,27 +3725,39 @@ impl Scripts {
         })
     }
 
+    /// Whether the command menu of the fight waits for the player's side: its lists of
+    /// items and of spells turn their pages with R2 (`keys.rs`).
+    pub fn fight_menu_waits(&self) -> bool {
+        (self.room.fight.as_ref()).is_some_and(|fight| fight.menu.is_some())
+    }
+
     /// The command menu of the fight while it waits for the player's side, as its last
     /// pass left it, and the game frame of that pass, for whoever paints it.
     pub fn fight_menu(&self) -> Option<FightMenu<'_>> {
         let fight = self.room.fight.as_ref()?;
-        // The menu is there while the fight waits for a command of the player's side.
+        // The menu is there while the fight waits for a command of the player's side; a
+        // fight of two players asks its lists of the duel's shadow (`versus.rs`).
+        let shadow = (fight.versus.as_ref()).and_then(|versus| versus.shadow());
+        let ruled = (fight.bout.as_ref()).map(|bout| &bout.fight).or(shadow);
         let asked = (fight.menu.as_ref())
-            .zip(fight.bout.as_ref())
+            .zip(ruled)
             .zip(self.room.fights.as_ref());
         if asked.is_none() && fight.hud.is_none() {
             return None;
         }
-        let places = item_places(&self.room.carried.keeping);
+        let places = match &fight.versus {
+            Some(versus) => versus.places(),
+            None => item_places(&self.room.carried.keeping),
+        };
         let (mut items, mut own) = (fight_menu_panel::Items::default(), Vec::new());
         // The box of the own side shows its subject (`0x800C9E69`), which the states of
         // a summon and of a leave write with the fighter on the field (`0x800C9E52`),
         // and the target while the picker of the own side is on one.
         let mut subject = fight.fighter;
         let mut moves = None;
-        if let Some(((menu, bout), rules)) = asked {
+        if let Some(((menu, ruled), rules)) = asked {
             let lists = fight_menu::Lists {
-                fight: &bout.fight,
+                fight: ruled,
                 tables: &rules.tables,
                 places: &places,
             };
@@ -3617,9 +3782,15 @@ impl Scripts {
         let drew = (asked.map(|((menu, _), _)| menu.drew())).unwrap_or_default();
         let time = jc_formats::menu::frame_time(self.room.game_frame, 2);
         let marks = fight_hud::Marks::of(drew.marks, time, fight.preview);
-        // The HUD goes by the records as the picture has them.
+        // The HUD goes by the records as the picture has them; a fight of two players
+        // shows its one opponent in the first box.
         let none = Default::default();
         let records = (fight.seen.as_ref()).map_or(&none, |seen| &seen.records);
+        let (records, marks) = match (&fight.versus, &fight.seen) {
+            (Some(_), Some(seen)) => versus::hud_view(records, seen.standing, marks),
+            _ => (records.clone(), marks),
+        };
+        let records = &records;
         Some(FightMenu {
             menu: asked.map(|((menu, _), _)| menu),
             items,
@@ -3634,6 +3805,7 @@ impl Scripts {
             }),
             names: std::array::from_fn(|slot| records[slot].as_ref().map(|record| record.name)),
             game_frame: self.room.game_frame,
+            duel: fight.versus.is_some(),
         })
     }
 
@@ -3665,6 +3837,16 @@ impl Scripts {
     /// record has seen it stand again.
     pub fn player_is_free(&self) -> bool {
         self.room.orders.state == 0 && !self.room.orders.taken && self.room.fight.is_none()
+    }
+
+    /// Whether a fight is on: from its first game frame (the room's picture held in
+    /// front of it) through the way back to the end of the results screen behind it
+    /// (`pace.rs`, the fight's speed).
+    pub fn fight_on(&self) -> bool {
+        self.room.fight.is_some()
+            || self.room.behind.is_some()
+            || self.room.results.is_some()
+            || self.room.awaits_results.is_some()
     }
 
     /// The fight of a script that is on screen in this game frame, with its camera.
@@ -3790,11 +3972,7 @@ impl Scripts {
         if self.room.pad.pressed & pad::CROSS == 0 || !self.room.confirm {
             return false;
         }
-        let taker = (self.tasks.iter())
-            .filter(|(_, over)| over.is_none())
-            .map(|(task, _)| task.number)
-            .find(|number| self.room.can_talk.contains(number));
-        let Some(number) = taker else {
+        let Some(number) = self.talk_taker() else {
             // The second half: with the task selector free, every object task that is
             // marked is told state 0. An object without a script of its own does not
             // take the press, so the pad's command stays.
@@ -3809,6 +3987,71 @@ impl Scripts {
             self.room.game_frame.saturating_sub(1)
         );
         true
+    }
+
+    /// The first half of the call for a talk: the first running task that waits with a
+    /// thing the player can talk to, which [`Scripts::talk`] gives the press.
+    fn talk_taker(&self) -> Option<i32> {
+        (self.tasks.iter())
+            .filter(|(_, over)| over.is_none())
+            .map(|(task, _)| task.number)
+            .find(|number| self.room.can_talk.contains(number))
+    }
+
+    /// What a press of the confirm button would do, asked without pressing (the build's
+    /// interaction hint, `hint.rs`): the test of [`Scripts::talk`] and of its second
+    /// half [`Scripts::call_objects`] with [`spot::PRESS`], on the talks and the marks
+    /// the last game frame left. None when the press would leave the pad's command as
+    /// it is. The marks are made anew in every game frame from where the player stood
+    /// at its start, so the answer is the one a press in the next game frame gets but
+    /// for the player's last step.
+    pub fn confirm_takes(&self) -> Option<Takes> {
+        if let Some(script) = self.talk_taker() {
+            return Some(Takes::Talk(script));
+        }
+        if self.room.selector >= 0 || !self.player_is_free() {
+            return None;
+        }
+        let room = &self.room;
+        let spots = (room.spots.iter()).any(|(spot, _, task)| {
+            (task.as_ref()).is_some_and(|task| task.waits_for(spot.thing, spot::PRESS))
+        });
+        [
+            (room.crossings.iter()).any(|crossed| crossed.crossing.would_press()),
+            (room.passings.iter()).any(|passed| passed.passing.would_press()),
+            (room.lock.as_ref()).is_some_and(|locked| locked.locking.would_press()),
+            (room.doors.iter()).any(|(_, _, swing)| swing.would_press()),
+            (room.finds.as_ref()).is_some_and(|(_, searched)| searched.search.would_press()),
+            (room.card.as_ref()).is_some_and(|carded| carded.floating.would_press()),
+            spots,
+            (room.switches.iter()).any(|(_, pressed)| pressed.would_press()),
+        ]
+        .into_iter()
+        .zip(Takes::OBJECTS)
+        .find_map(|(takes, what)| takes.then_some(what))
+    }
+
+    pub fn holds_story_fight(&self) -> bool {
+        (ScenePackage::parse(&self.file))
+            .is_ok_and(|package| holds_story_fight(&package, self.number))
+    }
+
+    /// The running task whose script still leads to a fight of a script: its segment,
+    /// and the ones its jumps lead to, hold a `0x65`. None in the room of the lessons
+    /// and once every such script has ended (a story whose fight is behind it ends
+    /// them).
+    pub fn story_fight_ahead(&self) -> Option<i32> {
+        if self.number == scene::LESSONS_FILE {
+            return None;
+        }
+        let package = ScenePackage::parse(&self.file).ok()?;
+        (self.tasks.iter())
+            .filter(|(_, over)| over.is_none())
+            .find(|(task, _)| {
+                (package.commands_from(task.segment).iter())
+                    .any(|command| command.code == scene::COMMAND_FIGHT)
+            })
+            .map(|(task, _)| task.number)
     }
 
     fn call_objects(&mut self, called: i32, by: &str) {
@@ -4036,6 +4279,80 @@ impl Scripts {
             return None;
         }
         self.room.end_card.take()
+    }
+
+    pub fn held_by(&self) -> Option<&'static str> {
+        let room = &self.room;
+        let screen = (room.screen.as_ref()).is_some_and(|asked| asked.state != Asking::Left);
+        let fade = room.fade.at_rest()
+            && room.fade.brightness == jc_formats::light::ONE
+            && room.fade.white == 0;
+        let asked = room.movie.is_some()
+            || room.map
+            || room.leaves.is_some()
+            || room.chapter.is_some()
+            || room.slot.is_some();
+        let held = [
+            (room.selector >= 0, "a script holds the game"),
+            (self.fight_on(), "a fight is on"),
+            (!self.player_is_free(), "the player's orders are taken"),
+            (
+                room.leaving.is_some(),
+                "the task that leaves the forest runs",
+            ),
+            (screen, "a screen of field mode 5 is asked for"),
+            (self.spoken().is_some(), "a message window is up"),
+            (room.roamers_held, "a script holds the roaming creatures"),
+            (asked, "a movie, the map, a room or a chapter is asked for"),
+            (
+                room.ending.is_some() || room.end_card.is_some(),
+                "the story ends",
+            ),
+            (!fade, "the picture fades"),
+        ];
+        held.into_iter().find_map(|(held, by)| held.then_some(by))
+    }
+
+    pub fn holder(&self) -> Option<i32> {
+        (self.room.selector >= 0).then_some(self.room.selector)
+    }
+
+    /// Whether a message window of a script that stands up is a question, from its
+    /// opening on: the player answers it, a skip of the scene stops at it.
+    pub fn asks(&self) -> bool {
+        (self.tasks.iter()).any(|(task, _)| {
+            (task.speech.window.as_ref())
+                .is_some_and(|window| !window.is_gone() && window.is_question())
+        })
+    }
+
+    /// The groups of the room's text that the message windows of the scripts show now,
+    /// for the build's record of the texts the player has read (`skip.rs`).
+    pub fn said_groups(&self) -> Vec<usize> {
+        (self.tasks.iter())
+            .filter(|(task, _)| {
+                (task.speech.window.as_ref()).is_some_and(|window| !window.is_gone())
+            })
+            .filter_map(|(task, _)| self.room.said.get(&task.number))
+            .map(|said| said.group)
+            .collect()
+    }
+
+    /// The build skips the scene, or no longer (`skip.rs`): the confirm goes down by
+    /// itself at every window that stands and is no question.
+    pub fn set_skipping(&mut self, skipping: bool) {
+        self.room.skipping = skipping;
+    }
+
+    /// Whether the build skips the scene ([`Scripts::set_skipping`]).
+    pub fn skipping(&self) -> bool {
+        self.room.skipping
+    }
+
+    /// The text of the place of the room's object of the memory card, when the room has
+    /// one: what a save made in the room names its place by.
+    pub fn place_text(&self) -> Option<[u8; 24]> {
+        self.room.card.as_ref().map(|carded| carded.text)
     }
 
     /// The screen a script asked for has left and the field has its mode 1 again: the
@@ -4974,9 +5291,16 @@ impl Engine for Running<'_> {
                     self.room.leave_out(command.code);
                 }
                 _ => {
+                    let before = self.room.carried.keeping.money();
                     let choice = asked.run(&mut self.room.carried.keeping, self.room.carried.worn);
                     if let Some(choice) = choice {
                         task.choice = choice as i32;
+                    }
+                    // `money_multiplier` (`assist.rs`) for the money a script gives.
+                    if let KeepingCommand::GiveMoney { .. } = asked {
+                        let times = crate::assist::now().money;
+                        let keeping = &mut self.room.carried.keeping;
+                        crate::assist::given_money(keeping, before, times, None);
                     }
                     info!(
                         "game frame {}: script {} runs {asked:?} (choice {choice:?}); the player has {} money",
@@ -6748,8 +7072,14 @@ impl Running<'_> {
             return;
         };
         let word = (fight.menu.as_ref()).map_or(0, |menu| menu.drew().leaves_out);
+        // A fight of two players has one opponent on the field, whichever minion of the
+        // other side it is: its box is the first one's (`versus.rs`).
+        let standing = match fight.versus {
+            Some(_) => versus::hud_standing(seen.standing),
+            None => seen.standing,
+        };
         hud.pass(fight_hud::Told {
-            standing: seen.standing,
+            standing,
             master: fight.master,
             opponents_away: word & fight_menu::sets::OPPONENTS_AWAY != 0,
             own_away: word & fight_menu::sets::OWN_AWAY != 0,
@@ -6769,6 +7099,9 @@ impl Running<'_> {
             // What the fight asks of the sound in front of its picture.
             match (fight.lead, fight.species) {
                 (Lasting::SILENT, _) => self.fight_sound(sound::fight_starts()),
+                (Lasting::MUSIC, _) if fight.versus.is_some() => {
+                    self.fight_sound(sound::versus_music())
+                }
                 (Lasting::MUSIC, Some(species)) => {
                     self.fight_sound(sound::fight_music(species, fight.boss()))
                 }
@@ -6806,8 +7139,12 @@ impl Running<'_> {
         if fight.frame == 1 {
             self.room.fade.fade_in(Lasting::RISES_OVER);
         }
-        // A fight that waits for a command is not through with its runs.
-        let left = fight.showing.is_some() || fight.at < fight.runs.len() || fight.bout.is_some();
+        // A fight that waits for a command is not through with its runs, nor is a fight
+        // of two players before its end.
+        let left = fight.showing.is_some()
+            || fight.at < fight.runs.len()
+            || fight.bout.is_some()
+            || fight.versus.is_some();
         let shown = fight.frame >= Lasting::HUB && self.room.fight_asks.is_none();
         let game_frame = self.room.game_frame;
         if let Some(place) = &self.room.fight_place {
@@ -6842,6 +7179,14 @@ impl Running<'_> {
         // Every run the rules have so far is shown and the player's side chooses: the
         // director comes to the choice and stands behind it until the command is there.
         let asked = fight.showing.is_none() && fight.at == fight.runs.len();
+        // A fight of two players waits for its dice, then for the command of the side
+        // whose turn it is, or at its end (`versus.rs`).
+        let versus = (fight.versus.as_ref()).is_some_and(|versus| asked || versus.rolls());
+        if shown && versus {
+            self.versus_waits(&mut fight);
+            self.room.fight = Some(fight);
+            return true;
+        }
         if shown && asked && fight.bout.is_some() && self.ask(&mut fight) {
             self.room.fight = Some(fight);
             return true;
@@ -6889,6 +7234,12 @@ impl Running<'_> {
                         // The fighter becomes the picked slot with it.
                         if let Some(slot) = self.put_figure(&mut fight.stood, run.actors) {
                             fight.fighter = slot;
+                        }
+                        // In a fight of two players the other side's minions come in
+                        // the same way, in the place of the opponent (`versus.rs`).
+                        if fight.versus.is_some() {
+                            let fields = (&mut fight.stood, &mut fight.seen, &mut fight.hud);
+                            self.put_opponent(fields, run.actors);
                         }
                     }
                     // A runner of the swap whose actor waits: the state in front of it
@@ -6947,7 +7298,12 @@ impl Running<'_> {
                 fighter: fight.fighter,
                 creature_in_front: fight.master == 2,
             };
-            if showing.step(&mut field) {
+            let over = showing.step(&mut field);
+            // What a fight of two players notes of the run for its pictures.
+            if let Some(versus) = fight.versus.as_mut() {
+                versus.note_run(showing);
+            }
+            if over {
                 info!(
                     "game frame {game_frame}: run {number} of the fight is over at {} of its \
                      clock, behind the key moment {} and the actor's end {}",
@@ -7184,8 +7540,15 @@ impl Running<'_> {
             places: &places,
         };
         let kept = self.room.menu_kept;
+        if fight.menu.is_none() {
+            self.room.fight_aim.forget();
+        }
         let menu = (fight.menu).get_or_insert_with(|| fight_menu::Menu::new(lists.offer(kept)));
-        let pass = menu.pass(&self.room.pad, &lists);
+        // The mouse steers the menu's cursor with the pad's own presses.
+        let mut pad = self.room.pad;
+        let here = fight_menu_panel::here(menu);
+        (self.room.fight_aim).steer(&mut pad, here, |spot| fight_menu_panel::way(menu, spot));
+        let pass = menu.pass(&pad, &lists);
         // The preview stands behind the drawing and in front of the input: the resolver
         // decides the command for the box's fighter, with draws of the fight's own.
         let before = fight.preview;
@@ -7538,6 +7901,7 @@ impl Running<'_> {
             hud: None,
             seen: None,
             master: u8::from(mode == 0),
+            versus: None,
         });
     }
 
@@ -7624,7 +7988,9 @@ impl Running<'_> {
             return;
         };
         self.room.outcome = outcome;
-        let forgotten = matches!(outcome, ended::WON | ended::RAN);
+        // `respawn = always` (`assist.rs`): the creature is not forgotten and comes back.
+        let gone = matches!(outcome, ended::WON | ended::RAN);
+        let forgotten = crate::assist::forgets(gone, crate::assist::now().respawn);
         // In the corridor of the second round the word is the piece's own.
         match (forgotten, &mut self.room.carried.corridor) {
             (false, _) => {}

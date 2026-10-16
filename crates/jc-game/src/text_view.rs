@@ -1450,7 +1450,7 @@ pub fn paint_script_talk(
 const IN_FRONT: f32 = 10.0;
 
 /// The keyboard as the pad's word of held buttons.
-fn keyboard(keys: &ButtonInput<KeyCode>) -> u16 {
+fn keyboard(keys: &crate::keys::Pad) -> u16 {
     let window = pad::CROSS | pad::TRIANGLE | pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT;
     crate::keys::held(keys) & window
 }
@@ -1458,7 +1458,7 @@ fn keyboard(keys: &ButtonInput<KeyCode>) -> u16 {
 /// One pass of a window that runs, once a game frame.
 pub fn run_talk(
     talk: Option<ResMut<Talk>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     mut exit: MessageWriter<AppExit>,

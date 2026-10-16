@@ -44,7 +44,7 @@ pub mod flag {
 
 /// What an opponent of a level is worth, and where a fighter of a level stands with
 /// its way to the next: a level costs twice the level before (`0x80012204`).
-fn worth(level: u32, way: u32) -> u128 {
+pub fn worth(level: u32, way: u32) -> u128 {
     match level {
         0 => U,
         // The game counts in double precision and no fighter comes near level 100,
@@ -56,6 +56,13 @@ fn worth(level: u32, way: u32) -> u128 {
 /// The experience word of a worth (`0x80012358`): the levels in bits 26 and up, the
 /// way to the next below them.
 fn read(total: u128) -> u32 {
+    let (levels, way) = levels_of(total);
+    (levels << 26).wrapping_add(way)
+}
+
+/// The levels of a worth, 99 at most, and the way to the next, apart: what
+/// [`read`] puts into one word.
+pub fn levels_of(total: u128) -> (u32, u32) {
     let mut rest = total.saturating_sub(U);
     let (mut levels, mut cost) = (0u32, U);
     while levels < HIGHEST_READ && cost <= rest {
@@ -63,7 +70,7 @@ fn read(total: u128) -> u32 {
         cost *= 2;
         levels += 1;
     }
-    (levels << 26).wrapping_add((rest / (cost / U)) as u32)
+    (levels, (rest / (cost / U)) as u32)
 }
 
 /// What a fighter of `level` with the experience word `way` gains from an opponent

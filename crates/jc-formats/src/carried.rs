@@ -222,6 +222,21 @@ pub fn write_model(block: &mut [u8; save::BLOCK], worn: Worn, looks: &[usize]) -
     true
 }
 
+/// The chapter a block holds (+0x2DC), as [`Carried::read_block`] reads it: for the
+/// build's list of saves, which names a save's chapter.
+pub fn chapter_of(block: &[u8; save::BLOCK]) -> usize {
+    i16::from_le_bytes([block[at::CHAPTER], block[at::CHAPTER + 1]]).max(0) as usize
+}
+
+/// What the player has as a block holds it (+36), as [`Carried::read_block`] reads it:
+/// for the fight of two players, whose items come from each player's save.
+pub fn keeping_of(block: &[u8; save::BLOCK]) -> Keeping {
+    let keeping: &[u8; SAVED] = (&block[at::KEEPING..at::KEEPING + SAVED])
+        .try_into()
+        .expect("what he has lies in the block");
+    Keeping::from_bytes(keeping)
+}
+
 fn four(block: &[u8; save::BLOCK], at: usize) -> [u8; 4] {
     [block[at], block[at + 1], block[at + 2], block[at + 3]]
 }

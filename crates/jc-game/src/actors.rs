@@ -58,6 +58,7 @@ pub struct Roamers {
     /// The creatures the player carries, in the order of their slots: each gets a
     /// figure for a summon ([`figure`]).
     pub figures: Vec<Figure>,
+    pub versus: Vec<Figure>,
 }
 
 #[derive(Clone, Copy)]
@@ -509,6 +510,47 @@ pub fn standing(
                 standing.push(made);
             }
             Err(why) => lines.push(format!("carried creature {number}: no figure: {why}")),
+        }
+    }
+    // The figures of the other side's minions of a fight of two players, the same way,
+    // each with a video memory of its own.
+    for (number, other) in roamers.versus.iter().enumerate() {
+        let Some(noted) = other.noted(&exe, &arc) else {
+            lines.push(format!(
+                "the other side's minion {number}: no figure: its species has no model"
+            ));
+            continue;
+        };
+        memories.push(Memory {
+            list: usize::MAX - jc_formats::creatures::MOST_CARRIED - number,
+            noted: vec![noted],
+            sent: Vec::new(),
+            vram: Vram::new(),
+        });
+        let memory = memories.len() - 1;
+        let stood = stand(
+            disc,
+            archive,
+            package,
+            &exe,
+            &models,
+            (&figure(other), None, true, (false, true, false)),
+            (&own_places, &arc),
+            (&mut memories[memory], Some(other)),
+        );
+        match stood {
+            Ok((line, mut made)) => {
+                lines.push(format!(
+                    "the other side's minion {number}: actor {}, its own video memory; {line}",
+                    standing.len()
+                ));
+                made.memory = memory;
+                made.opponent = Some(number);
+                standing.push(made);
+            }
+            Err(why) => lines.push(format!(
+                "the other side's minion {number}: no figure: {why}"
+            )),
         }
     }
     let vrams = memories.into_iter().map(|memory| memory.vram).collect();
@@ -998,6 +1040,7 @@ fn stand(
         roams: None,
         mate: None,
         carried: None,
+        opponent: None,
         table: actor.record.word,
     };
     if actor.flags & 2 != 0 {

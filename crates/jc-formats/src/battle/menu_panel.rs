@@ -197,6 +197,35 @@ impl Tables {
     pub fn legend(&self, drew: Drew) -> Option<u32> {
         self.legends.get(usize::from(drew.level)).copied()
     }
+
+    /// The tables of a minion's menu in the build's fight of two players
+    /// (`menu::DuelOffer`): the creature's five cells with "Change" as wide as one
+    /// column, and a sixth cell "Item" beside it, the player's word of "Item" in the
+    /// place of his sixth cell, with his line of help of it.
+    pub fn for_duel(&self) -> Self {
+        let mut tables = self.clone();
+        let player = &self.lines[0];
+        let (Some(item), Some(beside)) = (player.get(4), player.get(5)) else {
+            return tables;
+        };
+        let rect = |line: &Vec<Piece>| line.first().map(|piece| piece.rect);
+        if let (Some(change), Some(narrow)) = (tables.lines[1].get_mut(4), rect(item)) {
+            for piece in change.iter_mut() {
+                piece.rect.w = narrow.w;
+            }
+        }
+        let cell = (item.iter())
+            .map(|piece| Piece {
+                rect: rect(beside).unwrap_or(piece.rect),
+                ..*piece
+            })
+            .collect();
+        tables.lines[1].push(cell);
+        if let Some(&help) = self.help[0].get(4) {
+            tables.help[1].push(help);
+        }
+        tables
+    }
 }
 
 /// The text a pass draws in a box: the message of a refused confirm, or on the root the
@@ -215,6 +244,92 @@ fn said(menu: &Menu, tables: &Tables) -> Option<usize> {
 /// list of items (`player_panel::items::LINES`) with what the fight's list holds, and
 /// for a creature its two lists; the player has neither.
 pub type Held<'a> = (&'a [Vec<Piece>], &'a Items, Option<(&'a Shapes, &'a Moves)>);
+
+/// A place of the menu's cursors as a pointer of the build names it (the game has
+/// none): the level and the place of its cursor.
+pub type Spot = (u8, i16);
+
+/// The spot the cursor is on.
+pub fn here(menu: &Menu) -> Spot {
+    (menu.level(), menu.cursor().at)
+}
+
+/// Where the spots of the level the last pass drew lie, each with a rectangle that
+/// shows it: the cells of the root, the rows of the three lists and of the picker of a
+/// target on the own side, and a target among the opponents where the fighter stands
+/// on the fight's picture: `opponents` has the rectangle of each opponent's slot
+/// there, which may reach beyond the console's 320 columns in a wide fight.
+pub fn spots(
+    menu: &Menu,
+    tables: &Tables,
+    (list, _, moves): Held,
+    own: &[(usize, bool)],
+    opponents: &[(usize, Rect)],
+) -> Vec<(Spot, Rect)> {
+    let drew = menu.drew();
+    let level = menu.level();
+    if drew.level >= level::DONE || drew.level != level {
+        return Vec::new();
+    }
+    let on = |rows: Vec<(i16, Rect)>| -> Vec<(Spot, Rect)> {
+        rows.into_iter()
+            .map(|(at, rect)| ((level, at), rect))
+            .collect()
+    };
+    match level {
+        level::ROOT if drew.picks.is_none() => {
+            let lines = tables.lines.get(menu.side()).map_or(&[][..], Vec::as_slice);
+            let first = menu.root().first;
+            let cells = player_panel::line_rects(lines).into_iter();
+            on(cells.map(|(cell, rect)| (cell - first, rect)).collect())
+        }
+        level::ITEMS => on(player_panel::row_rects(
+            list,
+            &items::PIECES,
+            items::FIRST_ROW,
+            items::STEP,
+        )),
+        level::ATTACKS => match moves {
+            Some((shapes, _)) => on(player_panel::row_rects(
+                &shapes.attacks,
+                &attacks::PIECES,
+                attacks::FIRST_ROW,
+                attacks::STEP,
+            )),
+            None => Vec::new(),
+        },
+        level::SPELLS => match moves {
+            Some((shapes, _)) => {
+                let moved = SPELLS_AT.0 - spells::PIECES[0];
+                let starts = spells::PIECES.map(|x| x + moved);
+                on(player_panel::row_rects(
+                    &shapes.spells,
+                    &starts,
+                    SPELLS_AT.1,
+                    spells::STEP,
+                ))
+            }
+            None => Vec::new(),
+        },
+        level::TARGET if drew.picks.is_some() => on(player_panel::picker_rects(own)),
+        level::TARGET => {
+            let places = menu.opponent_places().unwrap_or_default();
+            let at = |slot: &usize| opponents.iter().find(|(of, _)| of == slot);
+            let found = (places.iter().zip(0..))
+                .filter_map(|(slot, place)| at(slot).map(|(_, rect)| (place, *rect)));
+            on(found.collect())
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The directions that bring the cursor a step nearer to a spot of its level.
+pub fn way(menu: &Menu, (level, at): Spot) -> u16 {
+    match level == menu.level() {
+        true => menu.cursor().way_to(at),
+        false => 0,
+    }
+}
 
 /// What the last pass of the menu drew (`0x800C7F78`, and the message of the state
 /// `0x800C8AB4`), from what lies underneath to what lies on top; the line of help
@@ -434,6 +549,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_minion_of_the_fight_of_two_players_has_the_item_beside_the_change() {
+        let mut tables = tables();
+        tables.lines[1] = tables.lines[0][..5].to_vec();
+        tables.lines[1][4][0].rect.w = 76;
+        tables.help[1] = vec![6, 1, 7, 8, 9];
+        let duel = tables.for_duel();
+        assert_eq!(duel.lines[1].len(), 6);
+        assert_eq!(duel.lines[1][4][0].rect.w, 38);
+        let item = duel.lines[1][5][0];
+        assert_eq!(item.value, 104);
+        assert_eq!((item.rect.x, item.rect.y), (60, 195));
+        assert_eq!(duel.help[1], [6, 1, 7, 8, 9, 4]);
+        // The story's tables are as they were.
+        assert_eq!(tables.lines[1].len(), 5);
+    }
+
     /// A player alone against one opponent, with no empty cocoon.
     fn menu() -> Menu {
         Menu::new(Offer {
@@ -446,6 +578,7 @@ mod tests {
             places: 0,
             spells: 0,
             kept: 0,
+            duel: None,
         })
     }
 
@@ -459,6 +592,54 @@ mod tests {
         let items = Items::default();
         let width = |units: &[u16]| 6 * units.len() as i16;
         drawn(menu, &tables(), (&[], &items, None), &[], 7, |_| 30, width)
+    }
+
+    #[test]
+    fn a_target_among_the_opponents_is_found_where_the_fighter_stands() {
+        let mut menu = Menu::new(Offer {
+            fighter: 0,
+            carried: 0,
+            opponents: 0b0101_0000,
+            boss: false,
+            no_cocoon: true,
+            no_retreat: false,
+            places: 0,
+            spells: 0,
+            kept: 0,
+            duel: None,
+        });
+        let tables = tables();
+        let items = Items::default();
+        let rect = |x| Rect {
+            x,
+            y: 90,
+            w: 50,
+            h: 60,
+        };
+        // Slot 5 is not on the field; a place of the wide picture left of the console's.
+        let opponents = [(6, rect(-40)), (4, rect(130)), (5, rect(200))];
+        let found = |menu: &Menu| spots(menu, &tables, (&[], &items, None), &[], &opponents);
+        go(&mut menu, 0);
+        assert!(
+            found(&menu)
+                .iter()
+                .all(|((level, _), _)| *level == level::ROOT)
+        );
+        // "Attack" leads to a target among the opponents: a place for each that stands,
+        // in the order of their slots, at the fighter's rectangle.
+        go(&mut menu, pad::CROSS);
+        go(&mut menu, 0);
+        assert_eq!(menu.opponent_places(), Some(vec![4, 6]));
+        assert_eq!(
+            found(&menu),
+            [
+                ((level::TARGET, 0), rect(130)),
+                ((level::TARGET, 1), rect(-40))
+            ]
+        );
+        assert_eq!(way(&menu, (level::TARGET, 1)), pad::RIGHT);
+        // A target on the own side is picked in the picker's rows instead.
+        assert_eq!(self::menu().opponent_places(), None);
     }
 
     #[test]
@@ -763,6 +944,7 @@ mod tests {
                 places: 0,
                 spells: 1,
                 kept: 0,
+                duel: None,
             });
             (tables, menu)
         };

@@ -45,6 +45,7 @@ use crate::fight_effects::Playing;
 use crate::model_view::Mix;
 use crate::name_entry::Named;
 use crate::scripts::{Noticed, Scripts, Spoken};
+use crate::smooth::{self, Corners, Id, Motion};
 use crate::walker::Walker;
 
 const THING_SHADER: Handle<Shader> = uuid_handle!("3c7a1b52-94e6-4d0f-a8b3-61f2c07d9e45");
@@ -83,12 +84,20 @@ impl Plugin for ShownPlugin {
             .insert(&THING_SHADER, shader)
             .expect("a fixed handle takes an asset");
         app.add_plugins(Material2dPlugin::<ThingMaterial>::default())
+            .init_resource::<Steering>()
+            .init_resource::<smooth::Glide>()
+            .add_systems(
+                PostUpdate,
+                crate::display::keep_dither::<ThingMaterial>.after(crate::display::Fitting),
+            )
+            .add_systems(FixedUpdate, smooth::count_steps)
             .add_systems(
                 FixedUpdate,
                 (
                     step_things,
                     change_view,
                     follow_flags.after(field::tick_groups),
+                    count_game_frames,
                 )
                     .chain()
                     .run_if(crate::movie_view::room_runs),
@@ -98,15 +107,20 @@ impl Plugin for ShownPlugin {
             .add_systems(
                 Update,
                 (
+                    switch_glide,
                     draw_things,
+                    share_glide,
+                    glide_things,
                     draw_form,
                     follow_player
                         .before(field::place_groups)
                         .before(field::cut_to_the_area),
+                    glide_scroll.before(field::place_groups),
                     place_things,
                 )
                     .chain(),
             )
+            .add_systems(Update, point_at_answers)
             .add_systems(Update, crate::text_view::paint_script_talk)
             .add_systems(Update, crate::fight_menu_view::paint_fight_menu);
     }
@@ -128,6 +142,16 @@ pub struct ThingMaterial {
 impl From<&ThingMaterial> for Mix {
     fn from(material: &ThingMaterial) -> Self {
         material.mix
+    }
+}
+
+impl crate::display::Dithers for ThingMaterial {
+    fn dither(&self) -> f32 {
+        self.share.w
+    }
+
+    fn set_dither(&mut self, dither: f32) {
+        self.share.w = dither;
     }
 }
 
@@ -254,7 +278,8 @@ impl Skin {
                 TextureFormat::Rgba8Unorm,
                 RenderAssetUsages::RENDER_WORLD,
             )),
-            share: Vec4::splat(self.mix.share()),
+            // The fourth share is the dither (`display::keep_dither`).
+            share: Vec3::splat(self.mix.share()).extend(0.0),
             mix: self.mix,
         }
     }
@@ -276,6 +301,77 @@ struct Triangle {
     skin: Skin,
     corners: [Point; 3],
 }
+
+/// The triangles of a drawing, each with its [`smooth::Id`]: the thing they are added for
+/// now and the number of their face among the faces of the thing that were looked at, so
+/// that the next game frame knows them again (`smooth.rs`).
+#[derive(Default)]
+struct Drawing {
+    triangles: Vec<(Triangle, Id)>,
+    thing: u32,
+    faces: u32,
+}
+
+impl Drawing {
+    /// The triangles from here on are of `thing`, its faces counted from 0.
+    fn thing(&mut self, thing: u32) {
+        (self.thing, self.faces) = (thing, 0);
+    }
+
+    /// The faces of the thing from here on are counted from `faces`: a second kind of
+    /// face of the same thing (the stitch quads of a model).
+    fn faces_from(&mut self, faces: u32) {
+        self.faces = faces;
+    }
+
+    /// The number of the next face or quad of the thing, counted whether it is drawn or
+    /// not, so that a face turned away does not change the numbers of the others.
+    fn face(&mut self) -> u32 {
+        let face = self.faces;
+        self.faces = self.faces.wrapping_add(1);
+        face
+    }
+
+    /// Adds a triangle: `half` of the face (or quad) numbered `face`.
+    fn push(&mut self, (face, half): (u32, usize), triangle: Triangle) {
+        let face = face.wrapping_mul(2).wrapping_add(half as u32);
+        let id = Id {
+            thing: self.thing,
+            face,
+        };
+        self.triangles.push((triangle, id));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Triangle> {
+        self.triangles.iter().map(|(triangle, _)| triangle)
+    }
+}
+
+/// The things of a drawing as [`Drawing::thing`] names them: a kind in the upper half of
+/// the number, the number of one of its kind in the lower.
+mod thing {
+    pub const FIGHT_GROUND: u32 = 1 << 16;
+    pub const FIGHT_PICTURES: u32 = 2 << 16;
+    pub const FIGHT_STRIP: u32 = 3 << 16;
+    pub const SKY: u32 = 4 << 16;
+    pub const DOORS: u32 = 5 << 16;
+    pub const FOUND: u32 = 6 << 16;
+    pub const CARD: u32 = 7 << 16;
+    pub const SCATTERED: u32 = 8 << 16;
+    pub const SPARKS: u32 = 9 << 16;
+    pub const PLAYED: u32 = 10 << 16;
+    pub const SHOWN: u32 = 11 << 16;
+    pub const PLAYER: u32 = 12 << 16;
+    pub const ACTOR: u32 = 13 << 16;
+
+    /// The one of a kind with this number.
+    pub fn nth(kind: u32, number: usize) -> u32 {
+        kind | (number as u32 & 0xFFFF)
+    }
+}
+
+/// Where the stitch quads of a model are counted from among its faces.
+const STITCH_FACES: u32 = 1 << 24;
 
 /// What became of the faces of one record.
 #[derive(Default)]
@@ -380,6 +476,7 @@ pub struct Standing {
     pub roams: Option<Roams>,
     pub mate: Option<(usize, usize)>,
     pub carried: Option<usize>,
+    pub opponent: Option<usize>,
     pub table: u32,
 }
 
@@ -609,7 +706,10 @@ pub fn in_the_way(actors: &[Standing]) -> Vec<Thing> {
         hidden: actor.runner.hidden,
     };
     let own = |actor: &&Standing| {
-        actor.roams.is_none() && actor.mate.is_none() && actor.carried.is_none()
+        actor.roams.is_none()
+            && actor.mate.is_none()
+            && actor.carried.is_none()
+            && actor.opponent.is_none()
     };
     actors.iter().filter(own).map(thing).collect()
 }
@@ -666,6 +766,11 @@ pub struct Things {
     zoom: i32,
     /// The place of a fight, while one is drawn in place of the painted background.
     arena: Option<Arena>,
+    /// The last drawing was of a fight: a held picture is the fight's.
+    fight_drawn: bool,
+    /// Pixels of the console's screen the picture of a fight reaches beyond either side
+    /// of it in a wide window (`widescreen.rs`), 0 as on the console.
+    reach: i32,
     /// What the room was seen with before a fight of its scripts took the picture: the
     /// header of the view, the zoom and the video memories. None without such a fight.
     before_fight: Option<(ViewHeader, i32, Vec<Vram>)>,
@@ -692,6 +797,9 @@ pub struct Things {
     /// what the effect tasks of the game frame before have left, since they stand
     /// behind the player's task and the actors' in the list.
     fight_light: Option<Movable>,
+    /// What the last drawings put on screen, for the glide between two game frames
+    /// (`smooth.rs`); a new room starts without.
+    motion: Motion,
 }
 
 /// The creature of "View form": its actor, which stands at the room's origin, the video
@@ -767,6 +875,8 @@ impl Things {
             headers: Vec::new(),
             zoom: ZOOM_ONE,
             arena: None,
+            fight_drawn: false,
+            reach: 0,
             before_fight: None,
             ride_camera: None,
             fight_scroll: 0,
@@ -782,6 +892,7 @@ impl Things {
             effect_half: 0,
             effect_kept: Default::default(),
             fight_light: None,
+            motion: Motion::default(),
         }
     }
 
@@ -949,7 +1060,10 @@ impl Things {
             .and_then(Scripts::fought)
             .map(|fought| {
                 let place = &fought.place;
-                let placed = starts.then(|| (place.package.clone(), place.place.clone()));
+                // The next fight of two players may be in another place than the last.
+                let moved = (self.arena.as_ref()).is_some_and(|arena| arena.place != place.place);
+                let placed =
+                    (starts || moved).then(|| (place.package.clone(), place.place.clone()));
                 (fought.centre, fought.shot, fought.scroll, placed)
             });
         match fought {
@@ -961,7 +1075,9 @@ impl Things {
                          the centre {:?}",
                         place.file, centre.place
                     );
-                    self.before_fight = Some((self.header, self.zoom, self.vrams.clone()));
+                    if self.before_fight.is_none() {
+                        self.before_fight = Some((self.header, self.zoom, self.vrams.clone()));
+                    }
                     for vram in &mut self.vrams {
                         package.textures.iter().for_each(|image| vram.upload(image));
                     }
@@ -1221,16 +1337,16 @@ impl Things {
     /// The triangles of the creature that is looked at, with a line about it: seen
     /// through the room's second view at the room's zoom and lit by that view's lights.
     /// HYPOTHESIS: nothing of a fade of the room is in its colours.
-    fn form_triangles(&self) -> Option<(Vec<Triangle>, String)> {
+    fn form_triangles(&self) -> Option<(Drawing, String)> {
         let (form, (header, _)) = self.form.as_ref().zip(self.second_view.as_ref())?;
         if form.actor.runner.hidden {
             return Some((
-                Vec::new(),
+                Drawing::default(),
                 "the creature of \"View form\": not made yet".into(),
             ));
         }
         let camera = header.view_camera(self.zoom);
-        let mut triangles = Vec::new();
+        let mut triangles = Drawing::default();
         let eye = (header, &camera, Fade::default(), None);
         let line = Self::actor_seen(
             "the creature of \"View form\"",
@@ -1307,6 +1423,106 @@ impl Things {
     /// behind its end ([`Scripts::take_end_card`]).
     pub fn take_end_card(&mut self) -> Option<[u8; 24]> {
         self.scripts.as_mut().and_then(Scripts::take_end_card)
+    }
+
+    /// Whether the hero walks freely in the room, for the build's quick save and
+    /// autosave ([`Scripts::held_by`]): the room's scripts run and say so, the
+    /// actors and the player are passed and the picture is not held.
+    pub fn walks_freely(&self) -> bool {
+        self.held_by().is_none()
+    }
+
+    /// What a press of the confirm button would do while the hero walks freely
+    /// ([`Scripts::confirm_takes`]), for the build's interaction hint (`hint.rs`); none
+    /// in a scene, a fight, a fade or while a window stands.
+    pub fn confirm_takes(&self) -> Option<crate::scripts::Takes> {
+        if !self.walks_freely() {
+            return None;
+        }
+        self.scripts.as_ref()?.confirm_takes()
+    }
+
+    /// Where the top of the hero is seen as he was last drawn, in pixels right of and
+    /// below the projection centre: the middle of his picture across, its highest
+    /// point, `share` of the way from the game frame before when he glides
+    /// (`smooth.rs`). None without a hero or while a script hides him.
+    pub fn hero_top(&self, share: f32) -> Option<Vec2> {
+        let walker = self.player.as_ref()?;
+        if walker.player.flags & player::flag::HIDDEN != 0 || walker.body.runner.hidden {
+            return None;
+        }
+        let mut triangles = Drawing::default();
+        self.actor("player", &walker.body, &mut triangles);
+        let corners = triangles.iter().flat_map(|triangle| triangle.corners);
+        let (low, high) = corners.fold(
+            (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)),
+            |(low, high), corner| (low.min(corner.at), high.max(corner.at)),
+        );
+        // Between two game frames the hero is drawn a share of the way (`smooth.rs`).
+        let glide = self.motion.shift(thing::PLAYER, share);
+        (low.x <= high.x).then(|| Vec2::new((low.x + high.x) / 2.0, low.y) + glide)
+    }
+
+    /// Whether the room's scripts hold a fight of the story ([`Scripts::holds_story_fight`]).
+    pub fn holds_story_fight(&self) -> bool {
+        self.scripts
+            .as_ref()
+            .is_some_and(Scripts::holds_story_fight)
+    }
+
+    /// The running script that still leads to a fight of the story
+    /// ([`Scripts::story_fight_ahead`]).
+    pub fn story_fight_ahead(&self) -> Option<i32> {
+        self.scripts.as_ref()?.story_fight_ahead()
+    }
+
+    /// What keeps the hero from walking freely, for the log.
+    pub fn held_by(&self) -> Option<&'static str> {
+        let Some(scripts) = self.scripts.as_ref().filter(|_| !self.actors_still) else {
+            return Some("the room's scripts do not run");
+        };
+        if self.player.is_none() || self.player_still {
+            return Some("the room has no hero who walks");
+        }
+        if self.held.is_some() {
+            return Some("the picture is held");
+        }
+        scripts.held_by()
+    }
+
+    /// The script that holds the game while the room's scripts run
+    /// ([`Scripts::holder`]), for the build's skip of a scene (`skip.rs`).
+    pub fn holder(&self) -> Option<i32> {
+        let scripts = self.scripts.as_ref().filter(|_| !self.actors_still)?;
+        scripts.holder()
+    }
+
+    /// Whether a question of a script stands up ([`Scripts::asks`]).
+    pub fn asks(&self) -> bool {
+        self.scripts.as_ref().is_some_and(Scripts::asks)
+    }
+
+    /// The groups of the room's text the windows show now ([`Scripts::said_groups`]).
+    pub fn said_groups(&self) -> Vec<usize> {
+        (self.scripts.as_ref()).map_or_else(Vec::new, Scripts::said_groups)
+    }
+
+    /// The build skips the scene, or no longer ([`Scripts::set_skipping`]).
+    pub fn set_skipping(&mut self, skipping: bool) {
+        if let Some(scripts) = self.scripts.as_mut() {
+            scripts.set_skipping(skipping);
+        }
+    }
+
+    /// Whether the room's scripts are told that the build skips the scene.
+    pub fn skipping(&self) -> bool {
+        self.scripts.as_ref().is_some_and(Scripts::skipping)
+    }
+
+    /// The text of the place of the room's object of the memory card, when it has one
+    /// ([`Scripts::place_text`]).
+    pub fn place_text(&self) -> Option<[u8; 24]> {
+        self.scripts.as_ref().and_then(Scripts::place_text)
     }
 
     /// The screen a script of the room asked for has left.
@@ -1521,10 +1737,158 @@ impl Things {
         self.scripts.as_ref().and_then(Scripts::spoken)
     }
 
+    /// Whether the command menu of the room's fight waits for the player
+    /// ([`crate::scripts::Scripts::fight_menu_waits`]).
+    pub fn fight_menu_waits(&self) -> bool {
+        self.scripts.as_ref().is_some_and(Scripts::fight_menu_waits)
+    }
+
     /// The command menu of the room's fight while it waits for the player, and the
     /// game frame of its last pass.
     pub fn fight_menu(&self) -> Option<crate::scripts::FightMenu<'_>> {
         self.scripts.as_ref().and_then(Scripts::fight_menu)
+    }
+
+    /// A fight of two players comes on screen in the room's next game frame
+    /// (`scripts/versus.rs`), in place of the one that is there.
+    pub fn start_versus(&mut self, setup: crate::scripts::VersusSetup) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.start_versus(setup);
+        }
+    }
+
+    /// The room is the arena of a fight of two players: its scripts stop. False while
+    /// the room has no scripts.
+    pub fn for_versus(&mut self) -> bool {
+        let scripts = self.scripts.as_mut();
+        scripts.map(Scripts::for_versus).is_some()
+    }
+
+    /// Whether a fight of two players is on screen or about to come.
+    pub fn versus_on(&self) -> bool {
+        self.scripts.as_ref().is_some_and(Scripts::versus_on)
+    }
+
+    /// The duel as the session left it, what it waits for and the tally.
+    pub fn versus_update(
+        &mut self,
+        duel: &jc_formats::battle::duel::Duel,
+        step: Option<jc_formats::battle::duel::Step>,
+        series: jc_formats::versus::Series,
+    ) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.versus_update(duel, step, series);
+        }
+    }
+
+    /// The command the local menu of a fight of two players handed over.
+    pub fn take_versus_choice(&mut self) -> Option<jc_formats::battle::duel::Choice> {
+        self.scripts.as_mut()?.take_versus_choice()
+    }
+
+    /// The session did not take that command: the menu is made again.
+    pub fn versus_refused(&mut self) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.versus_refused();
+        }
+    }
+
+    /// The answer to "Rematch?", once given.
+    pub fn take_versus_rematch(&mut self) -> Option<bool> {
+        self.scripts.as_mut()?.take_versus_rematch()
+    }
+
+    /// The game frames the local menu of a fight of two players has been up for, and
+    /// those the end of the fight has waited for its answer.
+    pub fn versus_menu_frames(&self) -> Option<u32> {
+        self.scripts.as_ref()?.versus_menu_frames()
+    }
+
+    pub fn versus_over_frames(&self) -> Option<u32> {
+        self.scripts.as_ref()?.versus_over_frames()
+    }
+
+    /// The moments of a fight of two players a check takes pictures of.
+    pub fn take_versus_moments(&mut self) -> Vec<crate::scripts::VersusMoment> {
+        (self.scripts.as_mut()).map_or_else(Vec::new, Scripts::take_versus_moments)
+    }
+
+    /// What the build draws over a fight of two players.
+    pub fn versus_shown(&self) -> Option<crate::scripts::VersusShown> {
+        self.scripts.as_ref()?.versus_shown()
+    }
+
+    /// Once a frame: the mouse over a spot of those boxes, while they have any.
+    pub fn versus_point(
+        &mut self,
+        mouse: &crate::pointer::Mouse,
+        under: Option<crate::scripts::VersusSpot>,
+        aimed: bool,
+    ) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.versus_point(mouse, under, aimed);
+        }
+    }
+
+    /// Where the opponents of the fight on screen stand on the console's screen, for a
+    /// pointer of the build (the game has none; `pointer.rs`): for each slot of an
+    /// opponent that an actor stands for, the rectangle round the joints of its pose as
+    /// the fight's camera projects them, from the projection centre in the middle of
+    /// the screen, a little larger. In a wide fight it may lie beyond the console's 320
+    /// columns. Empty outside a fight.
+    pub fn opponents_on_screen(&self) -> Vec<(usize, jc_formats::menu::Rect)> {
+        use jc_formats::battle::fight::{OPPONENTS, SLOTS};
+        /// Pixels the rectangle reaches beyond the outermost joints.
+        const AROUND: f64 = 8.0;
+        let Some(scripts) = self.scripts.as_ref().filter(|_| self.arena.is_some()) else {
+            return Vec::new();
+        };
+        let centre = [
+            f64::from(SCREEN.0 / 2),
+            f64::from(SCREEN.1 / 2 + self.fight_scroll),
+        ];
+        (OPPONENTS..SLOTS)
+            .filter_map(|slot| {
+                let actor = self.actors.get(scripts.stands_for(slot)?)?;
+                let joints = (actor.pose.iter().flatten())
+                    .map(|placement| {
+                        std::array::from_fn(|k| actor.place[k] + placement.position[k])
+                    })
+                    .chain([actor.place]);
+                let seen: Vec<[f64; 2]> = joints.filter_map(|at| self.camera.project(at)).collect();
+                let edge = |axis: usize, most: bool| {
+                    let values = seen.iter().map(|at| at[axis] + centre[axis]);
+                    match most {
+                        true => values.fold(f64::MIN, f64::max) + AROUND,
+                        false => values.fold(f64::MAX, f64::min) - AROUND,
+                    }
+                };
+                let (left, top) = (edge(0, false), edge(1, false));
+                let (right, bottom) = (edge(0, true), edge(1, true));
+                let fits = |value: f64| (-1024.0..1024.0).contains(&value);
+                if seen.is_empty() || ![left, top, right, bottom].into_iter().all(fits) {
+                    return None;
+                }
+                let rect = jc_formats::menu::Rect {
+                    x: left.floor() as i16,
+                    y: top.floor() as i16,
+                    w: (right - left).ceil() as i16,
+                    h: (bottom - top).ceil() as i16,
+                };
+                Some((slot, rect))
+            })
+            .collect()
+    }
+
+    /// The mouse over a spot of the menu of the room's fight (`pointer.rs`).
+    pub fn point_at_fight(
+        &mut self,
+        mouse: &crate::pointer::Mouse,
+        under: Option<jc_formats::battle::menu_panel::Spot>,
+    ) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.point_at_fight(mouse, under);
+        }
     }
 
     /// The notice of the room's scripts that is up.
@@ -1556,7 +1920,10 @@ impl Things {
                 let talks = scripts.talk();
                 match scripts.player_is_free() && !talks {
                     true => held,
-                    false => Held::default(),
+                    false => {
+                        walker.stick = None;
+                        Held::default()
+                    }
                 }
             }
             None => held,
@@ -1841,13 +2208,13 @@ impl Things {
                 .unwrap_or(30)
         });
         if (self.effect.as_ref()).is_some_and(|playing| playing.passed() % every == 0)
-            && let Some(line) = self.effect_of_the_fight(&mut Vec::new())
+            && let Some(line) = self.effect_of_the_fight(&mut Drawing::default())
         {
             info!("{line}");
         }
     }
 
-    fn effect_of_the_fight(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn effect_of_the_fight(&self, triangles: &mut Drawing) -> Option<String> {
         use jc_formats::battle::effects::{self, Drawn, SPRITE_BLEND};
         let playing = self.effect.as_ref()?;
         let package = &playing.package;
@@ -1858,7 +2225,14 @@ impl Things {
         let (mut quads, mut faces) = (Count::default(), Count::default());
         let (mut shells, mut glows) = (Count::default(), Count::default());
         let (mut ribbons, mut seams) = (0, Count::default());
+        // Every thing an effect draws is a thing of its own, known from one game frame to
+        // the next by its kind and its place (`smooth::tracked`).
+        let mut kinds: BTreeMap<u32, usize> = BTreeMap::new();
         for drawn in playing.effects.drawn() {
+            let kind = effect_kind(drawn);
+            let nth = kinds.entry(kind).or_default();
+            triangles.thing(smooth::tracked(kind, *nth));
+            *nth += 1;
             match *drawn {
                 Drawn::Sprite {
                     sprite,
@@ -2285,6 +2659,74 @@ impl Things {
         self.arena.is_none() && (self.scripts.as_ref()).is_none_or(|scripts| scripts.background())
     }
 
+    /// Whether the picture on screen is a fight's: the place of a fight is drawn, or a
+    /// held picture is the last one of a fight (the way back from it). The room's
+    /// picture held in front of a fight is the room's.
+    pub fn fight_on_screen(&self) -> bool {
+        match self.held {
+            None => self.arena.is_some(),
+            Some(_) => self.fight_drawn,
+        }
+    }
+
+    /// Whether a fight of the room's scripts is on, from its start to the end of the
+    /// results screen behind it ([`Scripts::fight_on`]).
+    pub fn fight_on(&self) -> bool {
+        self.scripts.as_ref().is_some_and(Scripts::fight_on)
+    }
+
+    /// Whether the picture is held as it was last drawn.
+    pub fn holds(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// What the picture of this game frame is seen with, for the cuts of `smooth.rs`.
+    fn eye(&self) -> smooth::Eye {
+        smooth::Eye {
+            at: self.header.camera,
+            looks: self.header.look_at,
+            roll: self.header.roll,
+            distance: i32::from(self.header.projection_distance),
+            view: self.view,
+            zoom: self.zoom,
+            fight: self.arena.is_some(),
+            reach: self.reach,
+        }
+    }
+
+    /// The share of the way between the last two drawings that a frame of the monitor
+    /// shows when the fixed clock has made `steps` steps and gone `fraction` of a step
+    /// on (`smooth.rs`): one, the last drawing as it is, after a cut, while the picture
+    /// is held and while the picture before is laid over every frame.
+    pub fn glide_share(&self, fraction: f32, steps: u64) -> f32 {
+        match self.held.is_some() || self.picture_before().is_some() {
+            true => 1.0,
+            false => self.motion.share(fraction, steps),
+        }
+    }
+
+    /// Whether the scroll offset may glide between the last two game frames: not after
+    /// a cut, at a zoom (the tiles are cut for one offset), in a fight (its offset is
+    /// the shake of a hit) or through the shake of a room's picture.
+    fn scroll_glides(&self) -> bool {
+        !self.motion.cuts()
+            && self.zoom == ZOOM_ONE
+            && self.arena.is_none()
+            && self.before_fight.is_none()
+            && self.room_shake == 0
+    }
+
+    /// The picture of a fight reaches `reach` pixels of the console's screen beyond
+    /// either side of it (`widescreen.rs`); a fight on screen is drawn again for it.
+    pub fn set_reach(&mut self, reach: i32) {
+        if self.reach != reach {
+            self.reach = reach;
+            if self.arena.is_some() {
+                self.drawn = false;
+            }
+        }
+    }
+
     pub fn picture_before(&self) -> Option<u32> {
         self.scripts.as_ref().and_then(Scripts::before)
     }
@@ -2337,19 +2779,23 @@ impl Things {
         Seen::Drawn((depth / DEPTHS_PER_SLOT) as u32, at)
     }
 
-    fn triangles(&self) -> (Vec<Triangle>, Vec<String>) {
-        let mut triangles = Vec::new();
+    fn triangles(&self) -> (Drawing, Vec<String>) {
+        let mut triangles = Drawing::default();
         let mut lines = Vec::new();
         lines.extend(self.place_of_the_fight(&mut triangles));
         // The place of a fight goes into the second table, the fighters and the effects
         // into the field's.
-        for triangle in &mut triangles {
+        for (triangle, _) in &mut triangles.triangles {
             triangle.slot += TABLE_SLOTS;
         }
         if self.arena.is_none() {
+            triangles.thing(thing::SKY);
             lines.extend(self.sky(&mut triangles));
+            triangles.thing(thing::DOORS);
             lines.extend(self.doors(&mut triangles));
+            triangles.thing(thing::FOUND);
             lines.extend(self.found(&mut triangles));
+            triangles.thing(thing::CARD);
             lines.extend(self.card(&mut triangles));
             lines.extend(self.scattered(&mut triangles));
             lines.extend(self.sparks(&mut triangles));
@@ -2363,6 +2809,7 @@ impl Things {
             ));
         }
         if let Some(walker) = &self.player {
+            triangles.thing(thing::PLAYER);
             lines.push(walker.line());
             // A player that a script has hidden is left out like a hidden actor.
             lines.push(match walker.player.flags & player::flag::HIDDEN {
@@ -2386,6 +2833,7 @@ impl Things {
             }
             // An actor with the hidden flag is left out by the game's draw routine, and
             // one whose place the matrix unit cannot bring to the screen.
+            triangles.thing(thing::nth(thing::ACTOR, number));
             lines.push(match (actor.runner.hidden, self.draws(actor)) {
                 (true, _) => format!("actor {number}: hidden until a script shows it"),
                 (false, false) => {
@@ -2400,8 +2848,9 @@ impl Things {
     }
 
     /// Adds what the records of the list show now, and a line about each record.
-    fn shown(&self, triangles: &mut Vec<Triangle>, lines: &mut Vec<String>) {
+    fn shown(&self, triangles: &mut Drawing, lines: &mut Vec<String>) {
         for (number, (show, clock, moved)) in self.shows.iter().enumerate() {
+            triangles.thing(thing::nth(thing::SHOWN, number));
             lines.push(match show.shown() {
                 Some(ShowWay::Model) => self.model(number, (show, *moved), clock, triangles),
                 Some(ShowWay::Sprite) => self.sprite(number, (show, *moved), clock, triangles),
@@ -2586,7 +3035,7 @@ impl Things {
         }
     }
 
-    fn actor(&self, who: &str, actor: &Standing, triangles: &mut Vec<Triangle>) -> String {
+    fn actor(&self, who: &str, actor: &Standing, triangles: &mut Drawing) -> String {
         let light = self.fight_light.or(self.room_light);
         let eye = (&self.header, &self.camera, self.fade(), light);
         Self::actor_seen(who, actor, eye, triangles)
@@ -2598,7 +3047,7 @@ impl Things {
         who: &str,
         actor: &Standing,
         (header, camera, fade, movable): (&ViewHeader, &ViewCamera, Fade, Option<Movable>),
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> String {
         let source = actor.memory;
         let scales = actor.scales();
@@ -2626,10 +3075,14 @@ impl Things {
             }
         }
         let mut count = Count::default();
-        for (object, place) in actor.block.objects.iter().zip(&places) {
+        let objects_and_places = actor.block.objects.iter().zip(&places);
+        for (number_of_object, (object, place)) in objects_and_places.enumerate() {
             let Some((place, light, word)) = place else {
                 continue;
             };
+            // The faces of an object are numbered from the object's number on, so that an
+            // object left out does not change the numbers of the others.
+            triangles.faces_from((number_of_object as u32) << 16);
             // Bit 4 of the word blends every face in the mode of bits 5 and 6, bit 7 mixes
             // the colours towards black by the share in the upper half.
             let forced = command::blend_of(*word);
@@ -2637,6 +3090,7 @@ impl Things {
             // The second byte moves the palette of every textured face down: the tint.
             let rows = (*word >> 8) as u8;
             for face in &object.faces {
+                let number = triangles.face();
                 let corners: Vec<[i32; 3]> = (face.corners.iter())
                     .map(|corner| in_room(place.place(corner.position)))
                     .collect();
@@ -2665,20 +3119,24 @@ impl Things {
                     })
                     .collect();
                 count.add(slot, &points);
-                for corners in face.triangles() {
+                for (half, corners) in face.triangles().iter().enumerate() {
                     for skin in Skin::of(face, forced, source) {
-                        triangles.push(Triangle {
-                            slot,
-                            over: false,
-                            skin: skin.lowered(rows),
-                            corners: corners.map(|index| points[index]),
-                        });
+                        triangles.push(
+                            (number, half),
+                            Triangle {
+                                slot,
+                                over: false,
+                                skin: skin.lowered(rows),
+                                corners: corners.map(|index| points[index]),
+                            },
+                        );
                     }
                 }
             }
         }
         let mut stitched = Count::default();
-        for stitch in &actor.block.stitches {
+        for (number, stitch) in actor.block.stitches.iter().enumerate() {
+            let number = STITCH_FACES + number as u32;
             let first = actor.skeleton.bones.get(stitch[0].object as usize);
             let Some(first) = first.filter(|bone| bone.is_drawn()) else {
                 continue;
@@ -2730,19 +3188,22 @@ impl Things {
                 (Some(mode), None) => [Some((None, Mix::of_mode(mode))), None],
                 (None, _) => [Some((None, Mix::Solid)), None],
             };
-            for corners in [[0, 1, 2], [1, 3, 2]] {
+            for (half, corners) in [[0, 1, 2], [1, 3, 2]].into_iter().enumerate() {
                 for (texels, mix) in skins.into_iter().flatten() {
-                    triangles.push(Triangle {
-                        slot,
-                        over: false,
-                        skin: Skin {
-                            source,
-                            page,
-                            texels,
-                            mix,
+                    triangles.push(
+                        (number, half),
+                        Triangle {
+                            slot,
+                            over: false,
+                            skin: Skin {
+                                source,
+                                page,
+                                texels,
+                                mix,
+                            },
+                            corners: corners.map(|index| points[index]),
                         },
-                        corners: corners.map(|index| points[index]),
-                    });
+                    );
                 }
             }
         }
@@ -2764,7 +3225,7 @@ impl Things {
         )
     }
 
-    fn sky(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn sky(&self, triangles: &mut Drawing) -> Option<String> {
         let (stand, travelled) = self.scripts.as_ref()?.sky()?;
         let Some(block) = &self.room_models else {
             return Some("the object of the sky: the room has no model block".to_string());
@@ -2773,6 +3234,7 @@ impl Things {
         let mut count = Count::default();
         for object in block.objects.iter().take(sky::MESH_OBJECTS) {
             for face in &object.faces {
+                let number = triangles.face();
                 let corners: Vec<[i32; 3]> = (face.corners.iter())
                     .map(|corner| stand.place(corner.position))
                     .collect();
@@ -2801,14 +3263,17 @@ impl Things {
                     })
                     .collect();
                 count.add(slot, &points);
-                for corners in face.triangles() {
+                for (half, corners) in face.triangles().iter().enumerate() {
                     for skin in Skin::of(face, None, 0) {
-                        triangles.push(Triangle {
-                            slot,
-                            over: true,
-                            skin,
-                            corners: corners.map(|index| points[index]),
-                        });
+                        triangles.push(
+                            (number, half),
+                            Triangle {
+                                slot,
+                                over: true,
+                                skin,
+                                corners: corners.map(|index| points[index]),
+                            },
+                        );
                     }
                 }
             }
@@ -2824,7 +3289,7 @@ impl Things {
         ))
     }
 
-    fn doors(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn doors(&self, triangles: &mut Drawing) -> Option<String> {
         let leaves = self.scripts.as_ref()?.door_leaves();
         if leaves.is_empty() {
             return None;
@@ -2845,7 +3310,7 @@ impl Things {
         ))
     }
 
-    fn found(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn found(&self, triangles: &mut Drawing) -> Option<String> {
         let meshes = self.scripts.as_ref()?.found_meshes();
         if meshes.is_empty() {
             return None;
@@ -2866,10 +3331,11 @@ impl Things {
         ))
     }
 
-    fn place_of_the_fight(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn place_of_the_fight(&self, triangles: &mut Drawing) -> Option<String> {
         let arena = self.arena.as_ref()?;
         let (package, place, centre) = (&arena.package, &arena.place, &arena.centre);
         let model = package.find(Kind::Model, u32::from(place.ground));
+        triangles.thing(thing::FIGHT_GROUND);
         let ground = model.map_or_else(Count::default, |index| {
             let stand = Placement {
                 position: centre.place,
@@ -2885,20 +3351,27 @@ impl Things {
         let on_screen = |seen: [f64; 3], axis: usize| {
             (seen[axis] * self.camera.distance / seen[2]).floor() as i32
         };
-        let mut add = |slot: u32, page: TexturePage, points: [Point; 4]| {
-            for corners in [[0, 1, 2], [1, 3, 2]] {
+        let add = |triangles: &mut Drawing,
+                   number: u32,
+                   (slot, page): (u32, TexturePage),
+                   points: [Point; 4]| {
+            for (half, corners) in [[0, 1, 2], [1, 3, 2]].into_iter().enumerate() {
                 for skin in Skin::of_sprite(page, None) {
-                    triangles.push(Triangle {
-                        slot,
-                        over: true,
-                        skin,
-                        corners: corners.map(|index| points[index]),
-                    });
+                    triangles.push(
+                        (number, half),
+                        Triangle {
+                            slot,
+                            over: true,
+                            skin,
+                            corners: corners.map(|index| points[index]),
+                        },
+                    );
                 }
             }
         };
 
         let mut pictures = Count::default();
+        triangles.thing(thing::FIGHT_PICTURES);
         for &number in &place.sprites {
             let Some(index) = package.find(Kind::Sprite, u32::from(number)) else {
                 continue;
@@ -2907,6 +3380,7 @@ impl Things {
             let texture = sprite.texture();
             let texels = texture.whole();
             for quad in (0..sprite.frames.len()).flat_map(|frame| sprite.quads(frame)) {
+                let face = triangles.face();
                 // A quad without a height is left out.
                 if quad.size[1] == 0 {
                     continue;
@@ -2927,12 +3401,13 @@ impl Things {
                 });
                 let slot = (i64::from(depth) / DEPTHS_PER_SLOT) as u32;
                 pictures.add(slot, &points);
-                add(slot, texture.page, points);
+                add(triangles, face, (slot, texture.page), points);
             }
         }
 
         // The strip: its height on screen comes from one point the way the camera looks.
         let mut pieces = 0;
+        triangles.thing(thing::FIGHT_STRIP);
         if let Some(first) = place.strip {
             let turn = Shot {
                 at: self.header.camera,
@@ -2941,10 +3416,13 @@ impl Things {
             }
             .turn();
             let foot = on_screen(self.camera.to_view(centre.strip_point(turn)), 1) + 1;
-            for piece in 0..arena::STRIP_PIECES {
-                let record = usize::from(first) + piece % arena::STRIP_PICTURES;
-                let found =
-                    (package.sprites.get(record)).zip(arena::strip_piece(turn, piece, distance));
+            // A wide picture has the strip's pieces beyond the screen's edges too.
+            for piece in arena::strip_pieces(distance, self.reach) {
+                let picture = piece.rem_euclid(arena::STRIP_PICTURES as i32) as usize;
+                let record = usize::from(first) + picture;
+                let found = (package.sprites.get(record)).zip(arena::strip_piece_reaching(
+                    turn, piece, distance, self.reach,
+                ));
                 let Some((sprite, (left, width))) = found else {
                     continue;
                 };
@@ -2959,7 +3437,9 @@ impl Things {
                     colour: Vec3::splat(bright),
                     uv: texels[corner],
                 });
-                add(arena::STRIP_SLOT, texture.page, points);
+                // A piece is known by its place in the strip.
+                let slot = (arena::STRIP_SLOT, texture.page);
+                add(triangles, piece as u32, slot, points);
                 pieces += 1;
             }
         }
@@ -2985,7 +3465,7 @@ impl Things {
         &self,
         block: &MeshBlock,
         meshes: &[(usize, Placement)],
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> Count {
         let fade = self.fade();
         let mut count = Count::default();
@@ -2996,6 +3476,7 @@ impl Things {
             let lights = Lights::of_view(&self.header, stand.position);
             let light = fade.lights(lights.on_bone(stand.position, &stand.matrix));
             for face in &object.faces {
+                let number = triangles.face();
                 let corners: Vec<[i32; 3]> = (face.corners.iter())
                     .map(|corner| stand.place(corner.position))
                     .collect();
@@ -3024,14 +3505,17 @@ impl Things {
                     })
                     .collect();
                 count.add(slot, &points);
-                for corners in face.triangles() {
+                for (half, corners) in face.triangles().iter().enumerate() {
                     for skin in Skin::of(face, None, 0) {
-                        triangles.push(Triangle {
-                            slot,
-                            over: true,
-                            skin,
-                            corners: corners.map(|index| points[index]),
-                        });
+                        triangles.push(
+                            (number, half),
+                            Triangle {
+                                slot,
+                                over: true,
+                                skin,
+                                corners: corners.map(|index| points[index]),
+                            },
+                        );
                     }
                 }
             }
@@ -3039,7 +3523,7 @@ impl Things {
         count
     }
 
-    fn played(&self, triangles: &mut Vec<Triangle>) -> Vec<String> {
+    fn played(&self, triangles: &mut Drawing) -> Vec<String> {
         let Some(parts) = self.scripts.as_ref().and_then(|scripts| scripts.played()) else {
             return Vec::new();
         };
@@ -3052,8 +3536,9 @@ impl Things {
             .map(|model| model.frame(0).len())
             .min()
             .unwrap_or(0);
-        (parts.iter().zip(models))
-            .map(|(&(part, frame), model)| {
+        (parts.iter().zip(models).enumerate())
+            .map(|(number, (&(part, frame), model))| {
+                triangles.thing(thing::nth(thing::PLAYED, number));
                 let name = part.model;
                 let Some(model) = model else {
                     return format!("the played model {name} is not in the room's package");
@@ -3093,7 +3578,7 @@ impl Things {
         number: usize,
         (show, moved): (&Show, Option<Moved>),
         clock: &ShowClock,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> String {
         let name = show.number;
         let found = self.package.as_ref().and_then(|package| {
@@ -3150,7 +3635,7 @@ impl Things {
         (placement, stand): (&Piece, &Stand),
         (colour, over): (Option<[u8; 3]>, bool),
         count: &mut Count,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) {
         let fade = self.fade();
         // The light record is picked for the place the object is drawn at.
@@ -3159,6 +3644,7 @@ impl Things {
             fade.lights(lights.on_bone(stand.drawn.position, &stand.turn))
         });
         for face in &object.faces {
+            let number = triangles.face();
             let corners: Vec<[i32; 3]> = (face.corners.iter())
                 .map(|corner| stand.drawn.place(corner.position))
                 .collect();
@@ -3187,14 +3673,17 @@ impl Things {
                 })
                 .collect();
             count.add(slot, &points);
-            for corners in face.triangles() {
+            for (half, corners) in face.triangles().iter().enumerate() {
                 for skin in Skin::of(face, placement.blend(), 0) {
-                    triangles.push(Triangle {
-                        slot,
-                        over,
-                        skin,
-                        corners: corners.map(|index| points[index]),
-                    });
+                    triangles.push(
+                        (number, half),
+                        Triangle {
+                            slot,
+                            over,
+                            skin,
+                            corners: corners.map(|index| points[index]),
+                        },
+                    );
                 }
             }
         }
@@ -3205,7 +3694,7 @@ impl Things {
         block: &MeshBlock,
         stood: &[Option<(usize, Piece, Stand)>],
         count: &mut Count,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) {
         use jc_formats::battle::effects;
         let fade = self.fade();
@@ -3219,7 +3708,8 @@ impl Things {
             })
             .collect();
         let mode = command::blend_of(effects::STITCH_WORD);
-        for stitch in &block.stitches {
+        for (number, stitch) in block.stitches.iter().enumerate() {
+            let number = STITCH_FACES + number as u32;
             let named = stitch.map(|corner| {
                 let number = usize::from(corner.object);
                 let (object, piece, stand) = stood.get(number)?.as_ref()?;
@@ -3268,25 +3758,28 @@ impl Things {
                 (Some(mode), None) => [Some((None, Mix::of_mode(mode))), None],
                 (None, _) => [Some((None, Mix::Solid)), None],
             };
-            for corners in [[0, 1, 2], [1, 3, 2]] {
+            for (half, corners) in [[0, 1, 2], [1, 3, 2]].into_iter().enumerate() {
                 for (texels, mix) in skins.into_iter().flatten() {
-                    triangles.push(Triangle {
-                        slot,
-                        over: false,
-                        skin: Skin {
-                            source: 0,
-                            page,
-                            texels,
-                            mix,
+                    triangles.push(
+                        (number, half),
+                        Triangle {
+                            slot,
+                            over: false,
+                            skin: Skin {
+                                source: 0,
+                                page,
+                                texels,
+                                mix,
+                            },
+                            corners: corners.map(|index| points[index]),
                         },
-                        corners: corners.map(|index| points[index]),
-                    });
+                    );
                 }
             }
         }
     }
 
-    fn card(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn card(&self, triangles: &mut Drawing) -> Option<String> {
         let (block, place, drawn) = self.scripts.as_ref()?.card_meshes()?;
         let mut count = Count::default();
         for piece in &drawn {
@@ -3327,7 +3820,7 @@ impl Things {
         number: usize,
         (show, moved): (&Show, Option<Moved>),
         clock: &ShowClock,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> String {
         let name = show.number;
         let found = self.package.as_ref().and_then(|package| {
@@ -3381,7 +3874,7 @@ impl Things {
         )
     }
 
-    fn scattered(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn scattered(&self, triangles: &mut Drawing) -> Option<String> {
         let (spots, counted) = self.scripts.as_ref()?.scattered()?;
         let found = self.package.as_ref().and_then(|package| {
             let index = package.find(Kind::Sprite, scatter::SPRITE)?;
@@ -3395,7 +3888,8 @@ impl Things {
         };
         let mut count = Count::default();
         let (mut started, mut too_large) = (0, 0);
-        for spot in spots {
+        for (number, spot) in spots.iter().enumerate() {
+            triangles.thing(thing::nth(thing::SCATTERED, number));
             let Some(frame) = spot.frame(counted, sprite.frames.len()) else {
                 continue;
             };
@@ -3419,7 +3913,7 @@ impl Things {
         ))
     }
 
-    fn sparks(&self, triangles: &mut Vec<Triangle>) -> Option<String> {
+    fn sparks(&self, triangles: &mut Drawing) -> Option<String> {
         let sparks = self.scripts.as_ref()?.sparks();
         if sparks.is_empty() {
             return None;
@@ -3444,7 +3938,8 @@ impl Things {
         };
         let mut count = Count::default();
         let mut too_large = 0;
-        for one in sparks {
+        for (number, one) in sparks.iter().enumerate() {
+            triangles.thing(thing::nth(thing::SPARKS, number));
             let Some(on) = ball.quads(one.on).first().map(|quad| quad.place) else {
                 continue;
             };
@@ -3473,7 +3968,7 @@ impl Things {
         stands: ([i32; 3], [i16; 3]),
         how: (bool, Option<u8>, bool),
         count: &mut Count,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> usize {
         let quads = (sprite.quads(frame), sprite.texture());
         self.quad_list(quads, stands, how, count, triangles)
@@ -3487,13 +3982,14 @@ impl Things {
         (place, angles): ([i32; 3], [i16; 3]),
         (in_front, blend, over): (bool, Option<u8>, bool),
         count: &mut Count,
-        triangles: &mut Vec<Triangle>,
+        triangles: &mut Drawing,
     ) -> usize {
         // A quad's colour is times the screen brightness, whatever bit 0x400 says.
         let bright = self.fade().brightness as f32 / light::ONE as f32;
         let colour_one = f32::from(TEXEL_UNCHANGED);
         let mut too_large = 0;
         for quad in &quads {
+            let number = triangles.face();
             let seen = self.camera.to_view(quad.stands(place, angles));
             // A quarter of the whole part of the distance into the screen.
             let depth = (seen[2].floor() as i64) >> 2;
@@ -3523,19 +4019,40 @@ impl Things {
                 false => (depth / DEPTHS_PER_SLOT) as u32,
             };
             count.add(slot, &points);
-            for corners in [[0, 1, 2], [1, 3, 2]] {
+            for (half, corners) in [[0, 1, 2], [1, 3, 2]].into_iter().enumerate() {
                 for skin in Skin::of_sprite(texture.page, blend) {
-                    triangles.push(Triangle {
-                        slot,
-                        over,
-                        skin,
-                        corners: corners.map(|index| points[index]),
-                    });
+                    triangles.push(
+                        (number, half),
+                        Triangle {
+                            slot,
+                            over,
+                            skin,
+                            corners: corners.map(|index| points[index]),
+                        },
+                    );
                 }
             }
         }
         too_large
     }
+}
+
+/// The kind of a thing an effect draws, for the glide of `smooth.rs`: its way and the
+/// sprite or model of the effect's package it shows.
+fn effect_kind(drawn: &jc_formats::battle::effects::Drawn) -> u32 {
+    use jc_formats::battle::effects::Drawn;
+    let (way, number) = match *drawn {
+        Drawn::Sprite { sprite, .. } => (0, sprite),
+        Drawn::Model { model, .. } => (1, model),
+        Drawn::Shape { model, .. } => (2, model),
+        Drawn::Piece { model, object, .. } => (3, model << 4 | object),
+        Drawn::Mixed { model, .. } => (4, model),
+        Drawn::Thrown { sprite, .. } => (5, sprite),
+        Drawn::Shed { sprite, .. } => (6, sprite),
+        Drawn::Ribbon { model, .. } => (7, model),
+        Drawn::Glow { glow, .. } => (8, glow),
+    };
+    way << 11 | (number as u32 & 0x7FF)
 }
 
 fn corner_colour(
@@ -3566,18 +4083,33 @@ fn corner_colour(
 pub struct ThingPiece {
     /// The place on the depth axis.
     depth: f32,
+    /// Where its corners glide from and to between two game frames (`smooth.rs`), and
+    /// the share of the way its mesh was last given; none for a piece that stands.
+    glides: Option<Glides>,
+    share: Option<f32>,
+}
+
+/// The corners of a piece's mesh as the game frame before put them and as the last one
+/// did.
+pub struct Glides {
+    from: Vec<[f32; 3]>,
+    to: Vec<[f32; 3]>,
 }
 
 /// One game frame: every record's clock and every actor's animation move on, and the
-/// player's controller runs with the buttons of its pad or, without one, of the keyboard:
-/// up, down and the two sides of `keys.rs` are forward, back and the turns, shift is the
-/// button that makes a run of a walk. A rising angle turns the player to the right as seen from above, the
-/// room's y pointing down.
+/// player's controller runs with the buttons of its pad or, without one, of the keyboard.
+/// With the modern movement of `[controls]` the directions steer as the screen shows
+/// ([`Steering`]); with the tank movement up, down and the two sides of `keys.rs` are
+/// forward, back and the turns. Shift turns a run into a walk or the other way round. A
+/// rising angle turns the player to the right as seen from above, the room's y pointing
+/// down.
 fn step_things(
     things: Option<ResMut<Things>>,
     named: Option<Res<Named>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    keys: Res<crate::keys::Pad>,
+    mut steering: ResMut<Steering>,
     opens: Option<Res<crate::player_menu::Opens>>,
+    skip: Option<Res<crate::skip::Skip>>,
 ) {
     let Some(mut things) = things else { return };
     if let Some(named) = named {
@@ -3590,17 +4122,50 @@ fn step_things(
     // A hidden run presses the button of the menu in the game frames it names.
     let game_frame = (things.scripts.as_ref()).map_or(0, Scripts::game_frames);
     let circle = opens.is_some_and(|opens| opens.presses(game_frame));
+    // The menu keys of the build are the button of the menu too, but in a fight, where
+    // the circle describes.
+    let fights = things.fight_menu().is_some();
+    // While the build skips a scene, and behind it until Start and the confirm are let
+    // go, the player's keys and buttons do not reach the room (`skip.rs`).
+    let muted = skip.is_some_and(|skip| skip.holds_the_pad());
+    let circle = circle || (keys.menu_key() && !fights && !muted);
     let circle = if circle { jc_formats::pad::CIRCLE } else { 0 };
-    let buttons = crate::keys::held(&keys) | circle;
+    let pressed = if muted { 0 } else { crate::keys::held(&keys) };
+    let buttons = pressed | circle;
+    // The player walks by the keys' directions alone, not by the wheel's.
+    let directions = if muted { 0 } else { keys.directions() };
+    let pushed = keys.stick().filter(|_| !muted);
+    let modern = keys.controls.movement == jc_disc::Movement::Modern;
     let keyboard = Held {
-        forward: buttons & jc_formats::pad::UP != 0,
+        forward: !modern && directions & jc_formats::pad::UP != 0,
         fast: crate::keys::fast(&keys),
         run: false,
-        back: buttons & jc_formats::pad::DOWN != 0,
-        falls: buttons & jc_formats::pad::LEFT != 0,
-        rises: buttons & jc_formats::pad::RIGHT != 0,
+        back: !modern && directions & jc_formats::pad::DOWN != 0,
+        falls: !modern && directions & jc_formats::pad::LEFT != 0,
+        rises: !modern && directions & jc_formats::pad::RIGHT != 0,
     };
     let pad = things.player.as_ref().and_then(Walker::held);
+    // The stick of the steering, for the keyboard and a gamepad only: a pad of a hidden
+    // run has none. The directions of the keys and the d-pad come first; without them
+    // the gamepad's left stick steers as the stick it is.
+    let things = &mut *things;
+    let stick = match (modern, pad.is_some(), &things.player) {
+        (true, false, Some(walker)) => {
+            let view = (&things.camera, &things.header);
+            let player = (walker.player.position, walker.player.angle);
+            match (directions, pushed) {
+                (0, Some(stick)) => steering.analog(stick, keys.runs(), view, player),
+                _ => steering.stick(directions, keys.runs(), view, player),
+            }
+        }
+        _ => {
+            steering.release();
+            None
+        }
+    };
+    if let Some(walker) = &mut things.player {
+        walker.stick = stick;
+    }
     // The directions reach a question's cursor as well as the walk.
     if let Some(scripts) = &mut things.scripts {
         scripts.hold(buttons);
@@ -3611,6 +4176,141 @@ fn step_things(
         pad.unwrap_or(keyboard),
         cross || buttons & jc_formats::pad::CROSS != 0,
     );
+}
+
+/// Once a frame, between the game frames: the mouse over the answers of a question in
+/// the room (`pointer.rs`).
+fn point_at_answers(things: Option<ResMut<Things>>, pointer: crate::pointer::Pointer) {
+    let Some(mut things) = things else { return };
+    let things = things.bypass_change_detection();
+    if let Some(scripts) = &mut things.scripts {
+        scripts.point(pointer.mouse(), pointer.on_room());
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct Steering {
+    /// The directions held in the game frame before, and the camera they were seen with.
+    directions: u16,
+    camera: Option<ViewCamera>,
+    /// The angle kept since the camera changed under the held keys.
+    kept: Option<i16>,
+}
+
+/// The stick's length of a walk and of a run: the game walks from about 52 and runs from
+/// about 105 (`player::stick_command`).
+const STICK_WALK: f64 = 80.0;
+const STICK_RUN: f64 = 127.0;
+/// Below this share of the two projected steps' lengths their cross product counts as
+/// none: the view is too flat to tell the room's axes apart on screen.
+const FLAT_VIEW: f64 = 0.05;
+
+impl Steering {
+    /// No direction is held.
+    fn release(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The stick of this game frame for the held directions, in the room's own axes; none
+    /// without a direction (two opposite ones cancel).
+    fn stick(
+        &mut self,
+        directions: u16,
+        runs: bool,
+        view: (&ViewCamera, &ViewHeader),
+        player: ([i32; 3], i16),
+    ) -> Option<[i8; 2]> {
+        use jc_formats::pad;
+        let on = |button: u16| f64::from(u8::from(directions & button != 0));
+        let screen = [on(pad::RIGHT) - on(pad::LEFT), on(pad::DOWN) - on(pad::UP)];
+        let length = if runs { STICK_RUN } else { STICK_WALK };
+        self.steer(directions, screen, length, view, player)
+    }
+
+    /// The stick of this game frame for a gamepad's left stick out of its dead zone (up
+    /// above 0, as far as it is pushed up to 1): its way on screen as the keys' way, and
+    /// its length as far as it is pushed (`gamepad::stick_length`). The nearest of its
+    /// eight ways stands for the held keys over a change of view.
+    fn analog(
+        &mut self,
+        stick: Vec2,
+        runs: bool,
+        view: (&ViewCamera, &ViewHeader),
+        player: ([i32; 3], i16),
+    ) -> Option<[i8; 2]> {
+        let directions = crate::gamepad::directions(stick.normalize_or_zero(), 0);
+        let screen = [f64::from(stick.x), -f64::from(stick.y)];
+        let length = crate::gamepad::stick_length(stick.length(), runs);
+        self.steer(directions, screen, length, view, player)
+    }
+
+    /// The stick for a way on screen (right, down) `length` long; `directions` are the
+    /// held ones that keep the angle over a change of view.
+    fn steer(
+        &mut self,
+        directions: u16,
+        screen: [f64; 2],
+        length: f64,
+        (camera, header): (&ViewCamera, &ViewHeader),
+        (place, angle): ([i32; 3], i16),
+    ) -> Option<[i8; 2]> {
+        if screen == [0.0, 0.0] {
+            self.release();
+            return None;
+        }
+        if self.directions != directions {
+            self.kept = None;
+        } else if self.kept.is_none() && self.camera.is_some_and(|seen| seen != *camera) {
+            info!(
+                "steering: the view changed under the held keys, the player keeps the angle \
+                 {angle}"
+            );
+            self.kept = Some(angle);
+        }
+        (self.directions, self.camera) = (directions, Some(*camera));
+        let wanted = match self.kept {
+            Some(kept) => f64::from(kept) * std::f64::consts::TAU / 4096.0,
+            None => on_screen(camera, place, screen)
+                .unwrap_or_else(|| by_camera_direction(header, screen)),
+        };
+        // Angle 0 lies along z and a quarter turn along x, as `ArcTangent::angle` has it.
+        let part = |value: f64| (value * length).round().clamp(-127.0, 127.0) as i8;
+        Some([part(wanted.sin()), part(wanted.cos())])
+    }
+}
+
+/// The room's direction, as a turn in radians from z towards x, that goes the way of the
+/// screen's direction (right, down) where the player stands; none in a view too flat.
+fn on_screen(camera: &ViewCamera, place: [i32; 3], screen: [f64; 2]) -> Option<f64> {
+    const STEP: i32 = 64;
+    let at = |x: i32, z: i32| camera.project([place[0] + x, place[1], place[2] + z]);
+    let (centre, along_x, along_z) = (at(0, 0)?, at(STEP, 0)?, at(0, STEP)?);
+    let x = [along_x[0] - centre[0], along_x[1] - centre[1]];
+    let z = [along_z[0] - centre[0], along_z[1] - centre[1]];
+    let cross = x[0] * z[1] - z[0] * x[1];
+    if cross.abs() < FLAT_VIEW * x[0].hypot(x[1]) * z[0].hypot(z[1]) {
+        return None;
+    }
+    // The room's directions that go straight right and straight down the screen, each
+    // of length one: the depth of the picture does not squeeze a diagonal.
+    let room = |screen: [f64; 2]| {
+        let room_x = (z[1] * screen[0] - z[0] * screen[1]) / cross;
+        let room_z = (x[0] * screen[1] - x[1] * screen[0]) / cross;
+        let length = room_x.hypot(room_z);
+        [room_x / length, room_z / length]
+    };
+    let (right, down) = (room([1.0, 0.0]), room([0.0, 1.0]));
+    let room_x = right[0] * screen[0] + down[0] * screen[1];
+    let room_z = right[1] * screen[0] + down[1] * screen[1];
+    Some(room_x.atan2(room_z))
+}
+
+/// The game's own rule for a stick: the stick's angle on top of the direction the camera
+/// looks in.
+fn by_camera_direction(header: &ViewHeader, [right, down]: [f64; 2]) -> f64 {
+    let toward: [f64; 3] =
+        std::array::from_fn(|axis| f64::from(header.look_at[axis] - header.camera[axis]));
+    toward[0].atan2(toward[2]) + right.atan2(-down)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3677,8 +4377,14 @@ fn follow_flags(things: Option<ResMut<Things>>, screen: Option<ResMut<FieldScree
 }
 
 /// Puts the state of the clocks on screen, in place of what was there.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_things(
     things: Option<ResMut<Things>>,
+    (glide, times, skip): (
+        Res<smooth::Glide>,
+        Option<ResMut<smooth::FrameTimes>>,
+        Option<Res<crate::skip::Skip>>,
+    ),
     pieces: Query<Entity, With<ThingPiece>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
@@ -3686,23 +4392,64 @@ pub fn draw_things(
     mut commands: Commands,
 ) {
     let Some(mut things) = things else { return };
+    // While the build skips a scene the screen is black (`skip.rs`): nothing is drawn,
+    // and the first drawing behind it glides from nowhere.
+    if skip.is_some_and(|skip| skip.covers()) {
+        things.bypass_change_detection().motion.forget();
+        return;
+    }
+    if things.held.is_some() {
+        things.bypass_change_detection().motion.hold();
+    }
     if things.drawn || things.held.is_some() {
         return;
     }
     let things = &mut *things;
     things.drawn = true;
+    things.fight_drawn = things.arena.is_some();
     for piece in &pieces {
         commands.entity(piece).despawn();
     }
-    let (triangles, lines) = things.triangles();
+    let (drawing, lines) = things.triangles();
     if !things.told {
         things.told = true;
         lines.iter().for_each(|line| info!("{line}"));
     }
+    // With the glide on, every triangle is known again from the drawing before and
+    // glides from where it was there (`smooth.rs`).
+    let (triangles, ids): (Vec<Triangle>, Vec<Id>) = drawing.triangles.into_iter().unzip();
+    let started = std::time::Instant::now();
+    let froms = match glide.on {
+        true => {
+            let shapes: Vec<(Id, Corners)> = (triangles.iter().zip(&ids))
+                .map(|(triangle, id)| {
+                    let corners = Corners {
+                        at: triangle.corners.map(|corner| corner.at),
+                        uv: triangle.corners.map(|corner| corner.uv),
+                    };
+                    (*id, corners)
+                })
+                .collect();
+            things.motion.draw(things.eye(), &shapes, glide.steps)
+        }
+        false => {
+            things.motion.forget();
+            vec![None; triangles.len()]
+        }
+    };
+    if let Some(mut times) = times {
+        times.glided(started.elapsed());
+    }
     let (vrams, known) = (&things.vrams, &mut things.materials);
     let assets = (&mut *meshes, &mut *images, &mut *materials);
-    for (depth, mesh, material) in pieces_of(triangles, vrams, known, assets) {
-        commands.spawn((ThingPiece { depth }, Mesh2d(mesh), MeshMaterial2d(material)));
+    let triangles = triangles.into_iter().zip(froms).collect();
+    for (depth, mesh, material, glides) in pieces_of(triangles, vrams, known, assets) {
+        let piece = ThingPiece {
+            depth,
+            glides,
+            share: None,
+        };
+        commands.spawn((piece, Mesh2d(mesh), MeshMaterial2d(material)));
     }
 }
 
@@ -3710,7 +4457,7 @@ pub fn draw_things(
 /// the ordering table: for each its place on the depth axis, its mesh and its material.
 /// `known` are the materials that were made before, by their skin.
 fn pieces_of(
-    mut triangles: Vec<Triangle>,
+    mut triangles: Vec<Gliding>,
     vrams: &[Vram],
     known: &mut Vec<(Skin, Handle<ThingMaterial>)>,
     (meshes, images, materials): (
@@ -3718,58 +4465,67 @@ fn pieces_of(
         &mut Assets<Image>,
         &mut Assets<ThingMaterial>,
     ),
-) -> Vec<(f32, Handle<Mesh>, Handle<ThingMaterial>)> {
+) -> Vec<Made> {
     let mut pieces = Vec::new();
     triangles.reverse();
-    triangles.sort_by_key(|triangle| std::cmp::Reverse(triangle.slot));
+    triangles.sort_by_key(|(triangle, _)| std::cmp::Reverse(triangle.slot));
     let mut at = 0;
     while at < triangles.len() {
-        let slot = triangles[at].slot;
+        let slot = triangles[at].0.slot;
         let end = at
             + (triangles[at..].iter())
-                .take_while(|t| t.slot == slot)
+                .take_while(|(t, _)| t.slot == slot)
                 .count();
         // Runs of one skin, each a piece of its own a little nearer than the one before.
-        let mut runs: Vec<&[Triangle]> = Vec::new();
+        let mut runs: Vec<&[Gliding]> = Vec::new();
         let mut start = at;
         for index in at + 1..=end {
             let other = |a: &Triangle, b: &Triangle| a.skin != b.skin || a.over != b.over;
-            if index == end || other(&triangles[index], &triangles[start]) {
+            if index == end || other(&triangles[index].0, &triangles[start].0) {
                 runs.push(&triangles[start..index]);
                 start = index;
             }
         }
         let step = FACES_SPAN / runs.len() as f32;
         for (number, run) in runs.into_iter().enumerate() {
-            let skin = run[0].skin;
-            let from = match run[0].over {
+            let skin = run[0].0.skin;
+            let from = match run[0].0.over {
                 true => FACES_OVER,
                 false => FACES_FROM,
             };
-            let corners = || run.iter().flat_map(|triangle| triangle.corners);
+            let corners = || run.iter().flat_map(|(triangle, _)| triangle.corners);
             // The screen's y points down.
-            let mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::RENDER_WORLD,
-            )
-            .with_inserted_attribute(
-                Mesh::ATTRIBUTE_POSITION,
-                corners()
-                    .map(|corner| [corner.at.x, -corner.at.y, 0.0])
-                    .collect::<Vec<_>>(),
-            )
-            .with_inserted_attribute(
-                Mesh::ATTRIBUTE_COLOR,
-                corners()
-                    .map(|corner| [corner.colour.x, corner.colour.y, corner.colour.z, 1.0])
-                    .collect::<Vec<_>>(),
-            )
-            .with_inserted_attribute(
-                Mesh::ATTRIBUTE_UV_0,
-                corners()
-                    .map(|corner| corner.uv.map(|part| part as f32 / PAGE as f32))
-                    .collect::<Vec<_>>(),
-            );
+            let place = |at: Vec2| [at.x, -at.y, 0.0];
+            let to: Vec<[f32; 3]> = corners().map(|corner| place(corner.at)).collect();
+            // Where the corners glide from between two game frames (`smooth.rs`): kept
+            // with the piece, whose mesh the glide changes in every frame of the monitor.
+            let glides = run.iter().any(|(_, from)| from.is_some()).then(|| Glides {
+                from: (run.iter())
+                    .flat_map(|(triangle, from)| {
+                        from.unwrap_or(triangle.corners.map(|corner| corner.at))
+                    })
+                    .map(place)
+                    .collect(),
+                to: to.clone(),
+            });
+            let usage = match glides {
+                Some(_) => RenderAssetUsages::default(),
+                None => RenderAssetUsages::RENDER_WORLD,
+            };
+            let mesh = Mesh::new(PrimitiveTopology::TriangleList, usage)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, to)
+                .with_inserted_attribute(
+                    Mesh::ATTRIBUTE_COLOR,
+                    corners()
+                        .map(|corner| [corner.colour.x, corner.colour.y, corner.colour.z, 1.0])
+                        .collect::<Vec<_>>(),
+                )
+                .with_inserted_attribute(
+                    Mesh::ATTRIBUTE_UV_0,
+                    corners()
+                        .map(|corner| corner.uv.map(|part| part as f32 / PAGE as f32))
+                        .collect::<Vec<_>>(),
+                );
             let material = match known.iter().find(|(have, _)| *have == skin) {
                 Some((_, handle)) => handle.clone(),
                 None => {
@@ -3783,12 +4539,19 @@ fn pieces_of(
                 None => in_table(slot),
                 Some(slot) => in_table(TABLE_SLOTS) + in_table(slot) * SECOND_TABLE_SHARE,
             };
-            pieces.push((depth, meshes.add(mesh), material));
+            pieces.push((depth, meshes.add(mesh), material, glides));
         }
         at = end;
     }
     pieces
 }
+
+/// A triangle with the corners it glides from between two game frames (`smooth.rs`).
+type Gliding = (Triangle, Option<[Vec2; 3]>);
+
+/// A piece made of triangles: its place on the depth axis, its mesh, its material and
+/// the glide of its corners.
+type Made = (f32, Handle<Mesh>, Handle<ThingMaterial>, Option<Glides>);
 
 /// A piece of the creature the screen of file 44 shows on "View form".
 #[derive(Component)]
@@ -3838,7 +4601,10 @@ fn draw_form(
     let assets = (&mut *meshes, &mut *images, &mut *materials);
     // The depths of the ordering table, far to near, laid into the span over the screen.
     let deepest = (DEPTH_LIMIT / DEPTHS_PER_SLOT + 2) as f32 * SLOT_DEPTH;
-    for (depth, mesh, material) in pieces_of(triangles, vrams, known, assets) {
+    let triangles = (triangles.triangles.into_iter())
+        .map(|(triangle, _)| (triangle, None))
+        .collect();
+    for (depth, mesh, material, _) in pieces_of(triangles, vrams, known, assets) {
         let over = FORM_FROM + FORM_SPAN * (1.0 + depth / deepest).clamp(0.0, 1.0);
         let place = Vec3::new(scroll.x as f32 * factor, -scroll.y as f32 * factor, over);
         commands.spawn((
@@ -3911,14 +4677,238 @@ fn follow_player(
 }
 
 /// Moves the pieces with the background: the projection centre is the screen centre moved by
-/// the scroll offset.
-fn place_things(
+/// the scroll offset, and between two game frames by its glide (`smooth.rs`).
+pub(crate) fn place_things(
     screen: Option<Res<FieldScreen>>,
     mut pieces: Query<(&ThingPiece, &mut Transform)>,
 ) {
     let Some(screen) = screen else { return };
+    let scroll = screen.scroll.as_vec2() + screen.glide;
     for (piece, mut transform) in &mut pieces {
-        let place = Vec3::new(screen.scroll.x as f32, -screen.scroll.y as f32, piece.depth);
+        let place = Vec3::new(scroll.x, -scroll.y, piece.depth);
         transform.set_if_neq(Transform::from_translation(place));
+    }
+}
+
+/// Every game frame of a room that changed what is drawn, for the glide (`smooth.rs`):
+/// behind the steps of the game frame, so that the drawing knows how many game frames
+/// lie between it and the one before.
+fn count_game_frames(things: Option<ResMut<Things>>) {
+    let Some(mut things) = things else { return };
+    if !things.drawn {
+        things.bypass_change_detection().motion.tick();
+    }
+}
+
+/// The glide follows `smooth_motion` of `[display]`, in front of the drawing.
+fn switch_glide(prefs: Option<Res<crate::prefs::Prefs>>, mut glide: ResMut<smooth::Glide>) {
+    let on = prefs.is_some_and(|prefs| prefs.display.smooth_motion);
+    if glide.on != on {
+        info!(
+            "smooth motion: {}",
+            match on {
+                true => "on",
+                false => "off",
+            }
+        );
+        glide.on = on;
+    }
+}
+
+/// The share of the way between the last two drawings that this frame of the monitor
+/// shows, behind the drawing: how far the clock has gone into the next game frame, or
+/// what `--glide-at` of a check names.
+fn share_glide(
+    things: Option<Res<Things>>,
+    time: Res<Time<Fixed>>,
+    at: Option<Res<smooth::GlideAt>>,
+    mut glide: ResMut<smooth::Glide>,
+) {
+    let fraction = at.map_or_else(|| time.overstep_fraction(), |at| at.0);
+    let share = match (glide.on, things) {
+        (true, Some(things)) => things.glide_share(fraction, glide.steps),
+        _ => 1.0,
+    };
+    if glide.share != share {
+        glide.share = share;
+    }
+}
+
+/// Gives the mesh of every piece that glides its corners at the share of this frame.
+fn glide_things(
+    (glide, times): (Res<smooth::Glide>, Option<ResMut<smooth::FrameTimes>>),
+    mut pieces: Query<(&mut ThingPiece, &Mesh2d)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let started = std::time::Instant::now();
+    let share = glide.share;
+    for (mut piece, mesh) in &mut pieces {
+        let piece = piece.bypass_change_detection();
+        let Some(glides) = &piece.glides else {
+            continue;
+        };
+        if piece.share == Some(share) {
+            continue;
+        }
+        let Some(mut mesh) = meshes.get_mut(&mesh.0) else {
+            continue;
+        };
+        let at: Vec<[f32; 3]> = (glides.from.iter().zip(&glides.to))
+            .map(|(from, to)| {
+                let (from, to) = (Vec2::new(from[0], from[1]), Vec2::new(to[0], to[1]));
+                smooth::between(from, to, share).extend(0.0).to_array()
+            })
+            .collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, at);
+        piece.share = Some(share);
+    }
+    if let Some(mut times) = times {
+        times.glided(started.elapsed());
+    }
+}
+
+/// The scroll offsets of the last two game frames, for the glide of the scroll.
+#[derive(Default)]
+struct KeptScroll {
+    drawings: u64,
+    before: IVec2,
+    now: IVec2,
+}
+
+/// The glide of the scroll offset (`smooth.rs`): where the background and the pieces
+/// are drawn between two game frames, a share of the way from the offset of the game
+/// frame before to the last one's. Behind the scroll of this frame and in front of
+/// everything that is placed by it.
+fn glide_scroll(
+    things: Option<Res<Things>>,
+    screen: Option<ResMut<FieldScreen>>,
+    glide: Res<smooth::Glide>,
+    mut kept: Local<KeptScroll>,
+) {
+    let Some(mut screen) = screen else { return };
+    let wanted = match things {
+        Some(things) if glide.on => {
+            let drawings = things.motion.drawings();
+            if drawings != kept.drawings {
+                (kept.drawings, kept.before, kept.now) = (drawings, kept.now, screen.scroll);
+            } else if screen.scroll != kept.now {
+                // Moved without a game frame: no glide.
+                (kept.before, kept.now) = (screen.scroll, screen.scroll);
+            }
+            (things.scroll_glides())
+                .then(|| smooth::scroll_glide(kept.before, kept.now, glide.share))
+                .flatten()
+                .unwrap_or(Vec2::ZERO)
+        }
+        _ => Vec2::ZERO,
+    };
+    if screen.glide != wanted {
+        screen.glide = wanted;
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use super::*;
+    use jc_formats::pad;
+
+    /// A camera 1000 above and 2000 behind the origin along -z, looking at it: up the
+    /// screen is along +z, right along +x.
+    fn behind() -> ViewHeader {
+        let mut header = ViewHeader::parse(&[0; 0x200]).expect("a header");
+        (header.camera, header.look_at) = ([0, -1000, -2000], [0, 0, 0]);
+        header.projection_distance = 300;
+        header
+    }
+
+    fn turn_of(stick: [i8; 2]) -> f64 {
+        f64::from(stick[0]).atan2(f64::from(stick[1])).to_degrees()
+    }
+
+    #[test]
+    fn the_keys_go_the_way_the_screen_shows() {
+        let header = behind();
+        let camera = header.view_camera(ZOOM_ONE);
+        let mut steering = Steering::default();
+        let mut go = |directions| {
+            let stick = steering.stick(directions, true, (&camera, &header), ([0; 3], 0));
+            steering.release();
+            stick.map(turn_of)
+        };
+        let near = |seen: Option<f64>, wanted: f64| seen.is_some_and(|s| (s - wanted).abs() < 1.0);
+        assert!(near(go(pad::UP), 0.0), "{:?}", go(pad::UP));
+        assert!(near(go(pad::RIGHT), 90.0), "{:?}", go(pad::RIGHT));
+        assert!(near(go(pad::LEFT), -90.0), "{:?}", go(pad::LEFT));
+        assert!(
+            near(go(pad::DOWN).map(f64::abs), 180.0),
+            "{:?}",
+            go(pad::DOWN)
+        );
+        assert!(
+            near(go(pad::UP | pad::RIGHT), 45.0),
+            "{:?}",
+            go(pad::UP | pad::RIGHT)
+        );
+        assert_eq!(go(pad::UP | pad::DOWN), None);
+        assert_eq!(go(0), None);
+    }
+
+    #[test]
+    fn a_run_is_a_long_stick_and_a_walk_a_short_one() {
+        let header = behind();
+        let camera = header.view_camera(ZOOM_ONE);
+        let mut steering = Steering::default();
+        let run = steering.stick(pad::UP, true, (&camera, &header), ([0; 3], 0));
+        assert_eq!(
+            player::stick_command(run.unwrap()) & player::command::MOVEMENT,
+            1
+        );
+        let walk = steering.stick(pad::UP, false, (&camera, &header), ([0; 3], 0));
+        let walk = player::stick_command(walk.unwrap()) & player::command::MOVEMENT;
+        assert_eq!(walk, player::command::WALK);
+    }
+
+    #[test]
+    fn a_new_view_under_the_held_keys_keeps_the_angle_until_they_change() {
+        let header = behind();
+        let camera = header.view_camera(ZOOM_ONE);
+        // The camera of the next view looks the other way: up the screen is along -z.
+        let mut turned = header;
+        (turned.camera, turned.look_at) = ([0, -1000, 2000], [0, 0, 0]);
+        let other = turned.view_camera(ZOOM_ONE);
+        let mut steering = Steering::default();
+        let held = pad::UP;
+        let first = steering.stick(held, true, (&camera, &header), ([0; 3], 0));
+        assert!(turn_of(first.unwrap()).abs() < 1.0);
+        // The player's angle is 0 (along +z) when the view changes: it goes on that way.
+        let kept = steering.stick(held, true, (&other, &turned), ([0; 3], 0));
+        assert!(turn_of(kept.unwrap()).abs() < 1.0);
+        // Another key, and the new view counts.
+        let fresh = steering.stick(held | pad::LEFT, true, (&other, &turned), ([0; 3], 0));
+        let fresh = turn_of(fresh.unwrap());
+        assert!((fresh - 135.0).abs() < 1.0, "{fresh}");
+    }
+
+    #[test]
+    fn a_gamepads_stick_goes_its_own_way_and_runs_when_pushed_far() {
+        let header = behind();
+        let camera = header.view_camera(ZOOM_ONE);
+        let mut steering = Steering::default();
+        let mut go = |stick: Vec2, runs: bool| {
+            let view = (&camera, &header);
+            let stick = steering.analog(stick, runs, view, ([0; 3], 0)).unwrap();
+            steering.release();
+            let movement = player::stick_command(stick) & player::command::MOVEMENT;
+            (turn_of(stick), movement)
+        };
+        // Up and a little right: a little right of straight on, not the keys' 45.
+        let (turn, movement) = go(Vec2::new(0.3, 0.95).normalize(), true);
+        assert!((turn - 17.5).abs() < 1.0, "{turn}");
+        assert_eq!(movement, player::command::RUN);
+        let (turn, movement) = go(Vec2::new(-0.3, 0.0), true);
+        assert!((turn + 90.0).abs() < 1.0, "{turn}");
+        assert_eq!(movement, player::command::WALK);
+        // A walk is a walk however far the stick goes.
+        assert_eq!(go(Vec2::new(0.0, 1.0), false).1, player::command::WALK);
     }
 }

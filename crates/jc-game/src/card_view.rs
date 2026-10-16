@@ -1,12 +1,13 @@
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
 use jc_formats::card_panel::{self, Drawn, Sizes};
 use jc_formats::card_screen::{
-    self, Card, CardScreen, Cards, Game, Kind, SLOTS, Shape, Tables, state,
+    self, Card, CardScreen, Cards, EXTRA, Game, Kind, SLOTS, Shape, Tables, state,
 };
 use jc_formats::menu::{self, Frames, Style};
 use jc_formats::options_screen::Settings;
@@ -19,6 +20,8 @@ use crate::music::Music;
 use crate::name_entry::{Picture, SCREEN, WHOLE};
 use crate::options_view::{self, Parts};
 use crate::place_map::picture;
+use crate::pointer::{self, Aim, Pointer};
+use crate::prefs::{self, GameFeel};
 use crate::title::Press;
 
 type Failure = Box<dyn std::error::Error>;
@@ -152,17 +155,34 @@ pub struct CardView {
     time: f64,
     shown: Entity,
     over: bool,
+    /// The cursor record the mouse steers, and the place it steers it to
+    /// (`pointer.rs`).
+    aim: Aim<(usize, i16)>,
+    /// A save was written while the screen stood over a room.
+    saved: bool,
+    /// The lobby's list of saves: nothing is written, moved or deleted, and a load is
+    /// the lobby's ([`Picked`]).
+    read_only: bool,
 }
 
-/// The file of a slot in the folder of the cards.
-fn file_of(folder: &std::path::Path, port: usize, slot: usize) -> PathBuf {
+/// The save the lobby of the fight of two players took on the read-only list of loads
+/// ([`for_the_arena`]): the game of the save, as a load of "Continue" reads it.
+#[derive(Resource)]
+pub struct Picked(pub crate::saving::Loaded);
+
+/// The file of a slot in the folder of the cards; the slots behind the fifteen are the
+/// quick save and the autosaves (`quick.rs`).
+pub(crate) fn file_of(folder: &Path, port: usize, slot: usize) -> PathBuf {
+    if let Some(extra) = slot.checked_sub(SLOTS) {
+        return crate::quick::extra_file(folder, extra);
+    }
     folder
         .join(format!("card{}", port + 1))
         .join(format!("save{slot:02}.dat"))
 }
 
 /// The cards as the folder has them.
-fn read_cards(folder: &std::path::Path) -> Cards {
+fn read_cards(folder: &Path) -> Cards {
     let mut cards = Cards::default();
     for (port, files) in cards.files.iter_mut().enumerate() {
         for (slot, file) in files.iter_mut().enumerate() {
@@ -170,6 +190,50 @@ fn read_cards(folder: &std::path::Path) -> Cards {
         }
     }
     cards
+}
+
+/// The quick save and the autosaves as the folder has them.
+fn read_extra(folder: &Path) -> [Option<Vec<u8>>; EXTRA] {
+    std::array::from_fn(|n| std::fs::read(file_of(folder, 0, SLOTS + n)).ok())
+}
+
+/// When a save was made, by the machine's clock, and its chapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    at: String,
+    chapter: usize,
+}
+
+/// When the save in `path` was made and its chapter: as the file beside it says, or,
+/// for an older save without that, the time the file was last written and the chapter
+/// its block holds.
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    if let Some(saved) = prefs::read_saved(path) {
+        return Some(Stamp {
+            at: saved.saved_at,
+            chapter: saved.chapter as usize,
+        });
+    }
+    let mut buffer = std::fs::read(path).ok()?;
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    buffer.resize(card_screen::BUFFER, 0);
+    let mut memory = save::Memory::zeroed();
+    memory.read(&buffer, false).then_some(())?;
+    Some(Stamp {
+        at: crate::local_time::of(modified),
+        chapter: jc_formats::carried::chapter_of(&memory.block),
+    })
+}
+
+/// The chapter of a save's buffer.
+fn chapter_of(buffer: &[u8]) -> Option<usize> {
+    let mut memory = save::Memory::zeroed();
+    let mut buffer = buffer.to_vec();
+    buffer.resize(card_screen::BUFFER, 0);
+    memory.read(&buffer, false).then_some(())?;
+    Some(jc_formats::carried::chapter_of(&memory.block))
 }
 
 /// The screen for a PC has one list, the first card's. The saves of the second card's
@@ -193,6 +257,7 @@ fn gather_saves(folder: &std::path::Path) -> std::io::Result<Vec<(usize, usize)>
             std::fs::create_dir_all(parent)?;
         }
         std::fs::rename(&from, &into)?;
+        move_feel(&from, &into)?;
         moved.push((slot, to));
     }
     Ok(moved)
@@ -202,14 +267,30 @@ const SQUARE_SIGN: usize = 94;
 
 /// A deleted save is put away, not removed: its file is moved into the folder
 /// `deleted` of the saves under a name that is not there yet. Gives where it is now.
-fn put_away(folder: &std::path::Path, port: usize, slot: usize) -> std::io::Result<PathBuf> {
+fn put_away(folder: &Path, port: usize, slot: usize) -> std::io::Result<PathBuf> {
     let deleted = folder.join("deleted");
     std::fs::create_dir_all(&deleted)?;
-    let named = |n: u32| deleted.join(format!("card{}-save{slot:02}-{n:03}.dat", port + 1));
+    let from = file_of(folder, port, slot);
+    let stem = match slot < SLOTS {
+        true => format!("card{}-save{slot:02}", port + 1),
+        // The quick save and the autosaves by their own names.
+        false => (from.file_stem()).map_or_else(String::new, |stem| stem.to_string_lossy().into()),
+    };
+    let named = |n: u32| deleted.join(format!("{stem}-{n:03}.dat"));
     let to = (1..=999).map(named).find(|path| !path.exists());
     let to = to.ok_or_else(|| std::io::Error::other("the folder of deleted saves is full"))?;
-    std::fs::rename(file_of(folder, port, slot), &to)?;
+    std::fs::rename(&from, &to)?;
+    move_feel(&from, &to)?;
     Ok(to)
+}
+
+/// The game feel beside the save in `from` goes with it to `to`, where it has one.
+fn move_feel(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let feel = prefs::beside_save(from);
+    match feel.is_file() {
+        true => std::fs::rename(feel, prefs::beside_save(to)),
+        false => Ok(()),
+    }
 }
 
 /// Writes the files that are not in the folder as the cards have them.
@@ -278,11 +359,52 @@ impl Told {
 /// The cards of the folder with what a check tells of them.
 struct Held {
     cards: Cards,
+    /// The quick save and the autosaves, the card's slots behind the fifteen; only the
+    /// screen for a PC lists them.
+    extra: [Option<Vec<u8>>; EXTRA],
+    plain: bool,
     folder: PathBuf,
     told: Told,
     formatted: bool,
     /// The reads so far.
     reads: usize,
+    /// The game feel of the moment, which a save keeps beside its file; nothing in a
+    /// run that keeps no settings.
+    feel: Option<GameFeel>,
+    /// When the save of a slot was made and its chapter, for the box of the row under
+    /// the cursor.
+    stamps: BTreeMap<usize, Stamp>,
+    /// Nothing is written or deleted ([`for_the_arena`]).
+    read_only: bool,
+}
+
+impl Held {
+    /// The cards of `folder`; `plain` for the screen for a PC.
+    fn read(folder: &Path, told: Told, plain: bool) -> Self {
+        let mut held = Self {
+            cards: read_cards(folder),
+            extra: read_extra(folder),
+            plain,
+            folder: folder.to_path_buf(),
+            told,
+            formatted: false,
+            reads: 0,
+            feel: None,
+            stamps: BTreeMap::new(),
+            read_only: false,
+        };
+        if plain {
+            let saved: Vec<usize> = (0..SLOTS + EXTRA)
+                .filter(|&slot| held.has(0, slot))
+                .collect();
+            for slot in saved {
+                if let Some(stamp) = stamp_of(&file_of(folder, 0, slot)) {
+                    held.stamps.insert(slot, stamp);
+                }
+            }
+        }
+        held
+    }
 }
 
 impl Card for Held {
@@ -314,7 +436,10 @@ impl Card for Held {
     }
 
     fn has(&self, port: u8, slot: usize) -> bool {
-        self.cards.has(port, slot)
+        match slot.checked_sub(SLOTS) {
+            Some(extra) => port == 0 && self.extra.get(extra).is_some_and(Option::is_some),
+            None => self.cards.has(port, slot),
+        }
     }
 
     fn read(&mut self, port: u8, slot: usize) -> Result<Vec<u8>, i32> {
@@ -322,29 +447,70 @@ impl Card for Held {
         if self.told == Told::ReadFails && self.reads > self.cards.blocks(port) as usize {
             return Err(1);
         }
-        self.cards.read(port, slot)
+        let Some(extra) = slot.checked_sub(SLOTS) else {
+            return self.cards.read(port, slot);
+        };
+        let mut buffer = (self.extra.get(extra).cloned().flatten()).ok_or(5)?;
+        buffer.resize(card_screen::BUFFER, 0);
+        Ok(buffer)
     }
 
     fn write(&mut self, port: u8, slot: usize, buffer: &[u8]) -> i32 {
-        match self.told {
+        // The quick save and the autosaves are written by the game alone, and the list
+        // of the lobby writes nothing.
+        if slot >= SLOTS || self.read_only {
+            return 1;
+        }
+        let result = match self.told {
             Told::WriteFails => 1,
             _ => self.cards.write(port, slot, buffer),
+        };
+        if result == 0 {
+            let save = file_of(&self.folder, usize::from(port), slot);
+            let chapter = chapter_of(buffer).unwrap_or_default();
+            match prefs::write_feel(&save, self.feel.as_ref(), chapter) {
+                Ok(path) => info!(
+                    "the save screen: the game feel, the time and the chapter {chapter} are kept in {}",
+                    path.display()
+                ),
+                Err(err) => warn!("the save screen: the game feel is not kept: {err}"),
+            }
+            let at = crate::local_time::now();
+            self.stamps.insert(slot, Stamp { at, chapter });
         }
+        result
     }
 
     fn remove(&mut self, port: u8, slot: usize) -> i32 {
+        if self.read_only {
+            return 1;
+        }
         match put_away(&self.folder, usize::from(port), slot) {
             Ok(to) => {
                 info!(
                     "the save screen: the save of slot {slot} is deleted: its file is moved to {}",
                     to.display()
                 );
-                self.cards.remove(port, slot)
+                self.stamps.remove(&slot);
+                match slot.checked_sub(SLOTS) {
+                    Some(extra) => match self.extra.get_mut(extra).and_then(Option::take) {
+                        Some(_) => 0,
+                        None => 1,
+                    },
+                    None => self.cards.remove(port, slot),
+                }
             }
             Err(err) => {
                 error!("the save screen: the save of slot {slot} is not deleted: {err}");
                 1
             }
+        }
+    }
+
+    fn extra(&self) -> usize {
+        match self.plain {
+            true => EXTRA,
+            false => 0,
         }
     }
 }
@@ -370,7 +536,7 @@ impl CardView {
         (folder, presses, told, shape): (&std::path::Path, &[Press], Told, Shape),
         game: Option<crate::saving::Running>,
         settings: Settings,
-        shown: Entity,
+        (shown, read_only): (Entity, bool),
     ) -> Result<Self, Failure> {
         let config = LocalConfig::load()?;
         let mut disc = DiscImage::open(&config.disc_image)?;
@@ -413,7 +579,7 @@ impl CardView {
                 took: None,
             }),
         };
-        if shape == Shape::Plain {
+        if shape == Shape::Plain && !read_only {
             match gather_saves(folder) {
                 Ok(moved) if moved.is_empty() => {}
                 Ok(moved) => info!(
@@ -423,13 +589,8 @@ impl CardView {
                 Err(err) => warn!("the save screen: a save of card2 is not moved: {err}"),
             }
         }
-        let cards = Held {
-            cards: read_cards(folder),
-            folder: folder.to_path_buf(),
-            told,
-            formatted: false,
-            reads: 0,
-        };
+        let mut cards = Held::read(folder, told, shape == Shape::Plain);
+        cards.read_only = read_only;
         let screen = match shape {
             Shape::Original => CardScreen::open(kind, tables.cursors),
             Shape::Plain => CardScreen::open_plain(kind, tables.cursors, &cards),
@@ -456,7 +617,10 @@ impl CardView {
             owed: 0.0,
             time: 0.0,
             shown,
+            aim: Aim::default(),
             over: false,
+            saved: false,
+            read_only,
         })
     }
 
@@ -539,8 +703,11 @@ impl CardView {
         for drawn in card_panel::drawn(&self.tables, &self.screen, time, &Sized(parts)) {
             self.put(&mut screen, colour, drawn);
         }
-        // On the saves of the screen for a PC the legend names the square too.
-        let on_saves = self.screen.shape == Shape::Plain && self.screen.state == state::SLOTS;
+        // On the saves of the screen for a PC the legend names the square too, but on
+        // the lobby's list, which deletes nothing.
+        let on_saves = self.screen.shape == Shape::Plain
+            && self.screen.state == state::SLOTS
+            && !self.read_only;
         match on_saves {
             true => {
                 let mut legend = self.legend.clone();
@@ -549,6 +716,7 @@ impl CardView {
             }
             false => parts.legend(&mut screen, colour, &self.legend),
         }
+        self.paint_stamp(&mut screen, colour);
         // The busy sign lies in slot 0, on top of everything. Stand-in: its step goes
         // by the screen's own passes, the game's by the main loop's count.
         let step = card_panel::busy(&self.screen, self.passes);
@@ -557,6 +725,53 @@ impl CardView {
             crate::name_entry::blit(&mut screen, sign, (0, 0), size, card_panel::BUSY_AT, WHOLE);
         }
         screen
+    }
+
+    /// The box of the screen for a PC with when the save under the cursor was made and
+    /// its chapter, at the top right where the game's own screen names the card and
+    /// counts its blocks, while the list is up.
+    fn paint_stamp(&self, screen: &mut [u8], colour: i16) {
+        let listed = matches!(self.screen.state, state::SLOTS | state::ASK | state::DELETE);
+        let row = self.screen.row();
+        let filled = self.screen.filled.get(row).copied().unwrap_or(false);
+        if self.screen.shape != Shape::Plain || !listed || !filled || !self.screen.is_read(row) {
+            return;
+        }
+        let Some(stamp) = self.cards.stamps.get(&self.screen.slot()) else {
+            return;
+        };
+        let Some(rect) = menu::bounds([self.tables.frames[6], self.tables.frames[7]]) else {
+            return;
+        };
+        let style = Style {
+            kind: colour,
+            mode: 0,
+            blend: 1,
+        };
+        self.parts().frame(screen, rect, style, 0);
+        // In the font of the texts, which has the small letters and the signs; the
+        // lines are as far apart as those of a message.
+        let lines = [stamp.at.clone(), format!("Chapter {}", stamp.chapter)];
+        let high = card_panel::MESSAGE_LINE.1;
+        let top = rect.y + (rect.h - 2 * high) / 2;
+        for (n, line) in lines.iter().enumerate() {
+            let units = self.letters(line);
+            let at = (rect.x + 5, top + n as i16 * high);
+            self.parts().text(screen, &units, at, WHOLE);
+        }
+    }
+
+    /// A text of the build's in the wide letters of the font of the texts: a letter the
+    /// font does not have is a space.
+    fn letters(&self, text: &str) -> Vec<u16> {
+        let space = card_screen::wide_unit(b' ');
+        (text.bytes())
+            .map(card_screen::wide_unit)
+            .map(|unit| match self.font.table.contains(&unit) {
+                true => unit,
+                false => space,
+            })
+            .collect()
     }
 }
 
@@ -577,6 +792,37 @@ pub fn over_the_room(
     images: &mut Assets<Image>,
     commands: &mut Commands,
 ) -> Result<(), Failure> {
+    put_up(kind, game, kept, settings, (images, commands), false)
+}
+
+/// The list of loads of "Continue" for the lobby of the fight of two players
+/// (`lobby.rs`), over the lobby's screen as over the title's: read-only, and the save
+/// it takes is the lobby's ([`Picked`]). `game` is a new game's, which nothing writes.
+pub fn for_the_arena(
+    game: crate::saving::Running,
+    kept: &CardsKept,
+    settings: Settings,
+    images: &mut Assets<Image>,
+    commands: &mut Commands,
+) -> Result<(), Failure> {
+    put_up(
+        Kind::Continue,
+        game,
+        kept,
+        settings,
+        (images, commands),
+        true,
+    )
+}
+
+fn put_up(
+    kind: Kind,
+    game: crate::saving::Running,
+    kept: &CardsKept,
+    settings: Settings,
+    (images, commands): (&mut Assets<Image>, &mut Commands),
+    read_only: bool,
+) -> Result<(), Failure> {
     let (wide, high) = (SCREEN.0 as u32, SCREEN.1 as u32);
     let black = [0, 0, 0, 255].repeat(SCREEN.0 * SCREEN.1);
     let shown = crate::spawn_picture(commands, images, wide, high, black);
@@ -586,7 +832,7 @@ pub fn over_the_room(
         kept.told,
         kept.shape,
     );
-    let view = match CardView::read(kind, cards, Some(game), settings, shown) {
+    let view = match CardView::read(kind, cards, Some(game), settings, (shown, read_only)) {
         Ok(view) => view,
         Err(err) => {
             commands.entity(shown).despawn();
@@ -644,7 +890,7 @@ pub fn show_card(
         show.told,
         show.shape,
     );
-    match CardView::read(kind, kept, None, settings.0, shown) {
+    match CardView::read(kind, kept, None, settings.0, (shown, false)) {
         Ok(view) => {
             let saves = view
                 .cards
@@ -673,21 +919,31 @@ pub fn run_card(
     view: Option<ResMut<CardView>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     clock: Res<crate::saving::PlayClock>,
     over_room: Query<Entity, With<OverTheRoom>>,
     mut commands: Commands,
+    pointer: Pointer,
+    (prefs, kept, mut unsaved, room): (
+        Res<prefs::Prefs>,
+        Res<prefs::PrefsFile>,
+        ResMut<crate::guards::Unsaved>,
+        Option<Res<crate::ShowRoom>>,
+    ),
 ) {
     let Some(mut view) = view else {
         return;
     };
+    // A save keeps the game feel of this moment beside it.
+    view.cards.feel = kept.live().then(|| prefs.feel.clone());
+    let room = room.map(|room| room.number);
     if view.over {
         return;
     }
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     view.time += passed;
     view.owed += passed * PASSES_A_SECOND;
     let mut held = crate::keys::held(&keys);
@@ -696,6 +952,10 @@ pub fn run_card(
             held |= press.button;
         }
     }
+    // The lobby's list deletes nothing: the square is no button there.
+    if view.read_only {
+        held &= !jc_formats::pad::SQUARE;
+    }
     // The pad routine has run in every pass before the screen's first: a button that
     // is still down from the room did not go down on the screen.
     view.pad.get_or_insert_with(|| {
@@ -703,6 +963,17 @@ pub fn run_card(
         pad.read(held, Repeat::of(GAME_FRAME), 0);
         pad
     });
+    // The mouse over the places of the cursor the state moves.
+    let under = pointer.on_picture(view.shown, SCREEN);
+    let view = &mut *view;
+    match card_panel::spots(&view.tables, &view.screen) {
+        Some((record, spots)) => {
+            let spots = spots.into_iter().map(|(at, rect)| ((record, at), rect));
+            view.aim
+                .look(pointer.mouse(), pointer::row_under(spots, under));
+        }
+        None => view.aim.forget(),
+    }
     // The play clock counts on while the screen is up.
     if let Played::Running(game) = &mut view.game {
         game.at(&clock);
@@ -715,6 +986,14 @@ pub fn run_card(
         let view = &mut *view;
         let mut pad = view.pad.unwrap_or_default();
         pad.read(held, Repeat::of(GAME_FRAME), view.passes);
+        if let Some((record, _)) = card_panel::spots(&view.tables, &view.screen) {
+            let cursor = view.screen.cursors[record];
+            let way = |(to_record, at)| match to_record == record {
+                true => cursor.way_to(at),
+                false => 0,
+            };
+            view.aim.steer(&mut pad, (record, cursor.at), way);
+        }
         view.pad = Some(pad);
         let before = (view.screen.state, view.screen.routine, view.screen.slot());
         let pass = view.screen.pass(&pad, &mut view.cards, &mut view.game);
@@ -739,12 +1018,20 @@ pub fn run_card(
             );
         }
         match keep_cards(&view.folder, &view.cards.cards) {
+            _ if view.read_only => {}
             Ok(0) => {}
-            Ok(written) => info!(
-                "the memory card screen: pass {}: {written} file written to {}",
-                view.passes,
-                view.folder.display()
-            ),
+            Ok(written) => {
+                info!(
+                    "the memory card screen: pass {}: {written} file written to {}",
+                    view.passes,
+                    view.folder.display()
+                );
+                // The running game is saved: nothing is lost by closing the window.
+                if view.over_room && matches!(view.game, Played::Running(_)) {
+                    view.saved = true;
+                    unsaved.kept(room, clock.refreshes);
+                }
+            }
             Err(err) => error!("the memory card screen: a save is not kept: {err}"),
         }
         if let Some(word) = pass.ended {
@@ -764,15 +1051,29 @@ pub fn run_card(
             }
             let mut next = "what stands under it goes on";
             if word & card_screen::word::LOADED != 0
+                && view.read_only
                 && let Played::Running(game) = &mut view.game
                 && let Some(loaded) = game.loaded.take()
             {
+                commands.insert_resource(Picked(loaded));
+                next = "the lobby takes the save's team";
+            } else if word & card_screen::word::LOADED != 0
+                && let Played::Running(game) = &mut view.game
+                && let Some(mut loaded) = game.loaded.take()
+            {
+                // The game feel beside the save's file comes with it.
+                let save = file_of(
+                    &view.folder,
+                    usize::from(view.screen.port()),
+                    view.screen.slot(),
+                );
+                loaded.feel = kept.live().then(|| prefs::read_feel(&save)).flatten();
                 commands.insert_resource(loaded);
                 next = "the field starts anew with the loaded game";
             }
             // Behind "End Game" the field's task ends and the opening movie plays
             // (`end_game` in `main.rs`).
-            if word & card_screen::word::TO_TITLE != 0 {
+            if word & card_screen::word::TO_TITLE != 0 && !view.read_only {
                 commands.insert_resource(crate::saving::Ended);
                 next = "the field ends by \"End Game\"";
             }
@@ -780,6 +1081,10 @@ pub fn run_card(
                 "the memory card screen: pass {}: the screen leaves, {next}",
                 view.passes
             );
+            // The play clock ran on while the screen stood: a save counts from here.
+            if view.saved {
+                unsaved.kept(room, clock.refreshes);
+            }
             for entity in &over_room {
                 commands.entity(entity).despawn();
             }

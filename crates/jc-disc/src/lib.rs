@@ -6,7 +6,9 @@ mod archive;
 mod config;
 
 pub use archive::{ARCHIVE_PATH, Archive, EXE_PATH, Executable, FileEntry, TABLE_ENTRIES};
-pub use config::{ConfigError, LOCAL_CONFIG_NAME, LocalConfig, with_disc_image};
+pub use config::{
+    ConfigError, Controls, LOCAL_CONFIG_NAME, LocalConfig, Movement, with_disc_image,
+};
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

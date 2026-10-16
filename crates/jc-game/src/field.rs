@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 
 use bevy::asset::{RenderAssetUsages, uuid_handle};
 use bevy::camera::visibility::NoFrustumCulling;
-use bevy::camera::{CompositingSpace, ScalingMode, Viewport};
+use bevy::camera::{CompositingSpace, ScalingMode};
 use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -38,6 +38,12 @@ const OUTSIDE_DEPTH: f32 = 5.0;
 const WHITE_DEPTH: f32 = 4.0;
 /// Where the black of a held picture lies: over everything of the room, the white too.
 const DARK_DEPTH: f32 = 4.5;
+/// Pixels a rectangle over the whole screen, and the black of the draw area at a side of
+/// it, reach beyond either side of the console's screen: the picture of a widescreen
+/// fight sees that far (`widescreen.rs`; a 4:3 picture sees none of it).
+const BEYOND_THE_SIDES: i32 = 3 * SCREEN.0 / 2;
+/// The size of a rectangle over the whole screen, and beyond its sides.
+const OVER_THE_SCREEN: Vec2 = Vec2::new((SCREEN.0 + 2 * BEYOND_THE_SIDES) as f32, SCREEN.1 as f32);
 /// The colour of a tile that leaves its texels as they are.
 const TILE_UNCHANGED: u8 = 128;
 /// Where the shade of a group's solid pixels lies between them and its added ones.
@@ -61,10 +67,7 @@ impl Plugin for FieldPlugin {
                 FixedUpdate,
                 (scroll_with_keys, tick_groups).run_if(crate::movie_view::room_runs),
             )
-            .add_systems(
-                Update,
-                (fit_screen, place_groups, cut_to_the_area, draw_walk_lines),
-            );
+            .add_systems(Update, (place_groups, cut_to_the_area, draw_walk_lines));
     }
 }
 
@@ -336,6 +339,9 @@ pub struct FieldScreen {
     depths: Vec<u32>,
     /// The scroll offset in screen pixels: positive moves the picture right and down.
     pub scroll: IVec2,
+    /// How far the picture is drawn from the scroll offset between two game frames, in
+    /// screen pixels: the glide of `smooth_motion` (`smooth.rs`), zero without it.
+    pub glide: Vec2,
     /// The size of layer 0 at a zoom of one; the scroll routine measures it, at the zoom
     /// in use, against the draw area.
     layer: IVec2,
@@ -480,12 +486,9 @@ fn draw_walk_lines(
         return;
     };
     // The screen's y points down.
-    let place = |point: [f64; 2]| {
-        Vec2::new(
-            point[0] as f32 + screen.scroll.x as f32,
-            -(point[1] as f32 + screen.scroll.y as f32),
-        )
-    };
+    let scroll = screen.scroll.as_vec2() + screen.glide;
+    let place =
+        |point: [f64; 2]| Vec2::new(point[0] as f32 + scroll.x, -(point[1] as f32 + scroll.y));
     for line in &walk.lines {
         let Some([from, to]) = walk.camera.project_line(line.ends[0], line.ends[1]) else {
             continue;
@@ -505,7 +508,8 @@ fn draw_walk_lines(
 pub struct ScreenCamera;
 
 /// Marks the camera whose picture is the console's screen in the window: the room's own,
-/// unless the room is drawn into a kept picture first (`before.rs`).
+/// unless the room is drawn into a kept picture first (`before.rs`). `display.rs` fits
+/// it to the window with the other screens, and widens it for a wide picture.
 #[derive(Component)]
 pub struct Fitted;
 
@@ -576,7 +580,7 @@ pub fn spawn(
     });
     commands.spawn((
         White,
-        Mesh2d(meshes.add(Rectangle::new(SCREEN.0 as f32, SCREEN.1 as f32))),
+        Mesh2d(meshes.add(Rectangle::from_size(OVER_THE_SCREEN))),
         MeshMaterial2d(whitens.clone()),
         Transform::from_xyz(0.0, 0.0, WHITE_DEPTH),
         Visibility::Hidden,
@@ -588,6 +592,7 @@ pub fn spawn(
         groups,
         depths,
         scroll: IVec2::ZERO,
+        glide: Vec2::ZERO,
         layer,
         zoom: ZOOM_ONE,
         area: DrawArea::WHOLE,
@@ -781,7 +786,7 @@ pub fn place_groups(
         }));
         commands.spawn((
             Dark,
-            Mesh2d(meshes.add(Rectangle::new(SCREEN.0 as f32, SCREEN.1 as f32))),
+            Mesh2d(meshes.add(Rectangle::from_size(OVER_THE_SCREEN))),
             MeshMaterial2d(taken.add(TakenMaterial {
                 texture: texel,
                 share: darkens,
@@ -862,7 +867,9 @@ pub fn place_groups(
         {
             mesh.0 = wanted;
         }
-        let place = Vec3::new(screen.scroll.x as f32, -screen.scroll.y as f32, part.depth);
+        // Between two game frames the picture glides (`smooth.rs`); never at a zoom.
+        let scroll = screen.scroll.as_vec2() + screen.glide;
+        let place = Vec3::new(scroll.x, -scroll.y, part.depth);
         let placed = Transform::from_translation(place).with_scale(scale.extend(1.0));
         transform.set_if_neq(placed);
     }
@@ -899,7 +906,7 @@ pub fn cut_to_the_area(
     let Some(screen) = screen else { return };
     let outside = screen.area.outside();
     for (part, mut sprite, mut transform, mut visibility) in &mut parts {
-        let (x, y, width, height) = match part.0.checked_sub(outside.len()) {
+        let (mut x, y, mut width, height) = match part.0.checked_sub(outside.len()) {
             None => outside[part.0],
             Some(bar) => screen.cover[bar],
         };
@@ -908,6 +915,13 @@ pub fn cut_to_the_area(
             false => Visibility::Hidden,
         };
         visibility.set_if_neq(shown);
+        // Black at a side of the screen goes on beyond it, for a wide picture.
+        if x <= 0 {
+            (x, width) = (x - BEYOND_THE_SIDES, width + BEYOND_THE_SIDES);
+        }
+        if x + width >= SCREEN.0 {
+            width += BEYOND_THE_SIDES;
+        }
         let size = Some(Vec2::new(width as f32, height as f32));
         if sprite.custom_size != size {
             sprite.custom_size = size;
@@ -919,30 +933,5 @@ pub fn cut_to_the_area(
             OUTSIDE_DEPTH,
         );
         transform.set_if_neq(Transform::from_translation(place));
-    }
-}
-
-/// Keeps the console's screen as large as fits the window, at its own shape.
-fn fit_screen(window: Single<&Window>, mut camera: Single<&mut Camera, With<Fitted>>) {
-    let (width, height) = (window.physical_width(), window.physical_height());
-    let (across, down) = (SCREEN.0 as u32, SCREEN.1 as u32);
-    if width == 0 || height == 0 {
-        return;
-    }
-    let size = match width * down > height * across {
-        true => UVec2::new(height * across / down, height),
-        false => UVec2::new(width, width * down / across),
-    };
-    let position = (UVec2::new(width, height) - size) / 2;
-    let fits = camera
-        .viewport
-        .as_ref()
-        .is_some_and(|v| v.physical_position == position && v.physical_size == size);
-    if !fits {
-        camera.viewport = Some(Viewport {
-            physical_position: position,
-            physical_size: size,
-            ..default()
-        });
     }
 }

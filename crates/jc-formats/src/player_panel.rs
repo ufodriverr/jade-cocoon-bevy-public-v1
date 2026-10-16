@@ -2,8 +2,8 @@
 use crate::battle::record::{LEVEL, Record};
 use crate::menu::{Piece, Rect, Style, kind, piece, placed, sign};
 use crate::player_menu::{
-    CAUGHT, CAUGHT_ACROSS, CAUGHT_RECORDS, FIRST_LEVEL, ITEMS, MAGIC, OF_CREATURE, OF_PLAYER,
-    PlayerMenu, SPECIAL, STORY, STORY_THINGS, caught_rows, flag,
+    CAUGHT, CAUGHT_ACROSS, CAUGHT_RECORDS, FIRST_LEVEL, ITEMS, LEAVE_FOREST, MAGIC, OF_CREATURE,
+    OF_PLAYER, PlayerMenu, SPECIAL, STORY, STORY_THINGS, Spot, TARGET, caught_rows, flag,
 };
 use crate::rooms::Image;
 use crate::window::{Way, opened};
@@ -582,6 +582,114 @@ fn boxes_of_creatures(
         drawn.extend(gauge(2, way, LEVEL as i32, from(32, 66), clip));
     }
     drawn
+}
+
+/// Where the spots of the cursor lie on the screen that is up, each with a rectangle
+/// that shows it, for a pointer of the build (the game has none). `entries` are the
+/// lines of the player's and of a creature's entries, `items` and `story` those of the
+/// two lists, and `moves` those of a creature's spells and of its body attacks. A
+/// screen not here has none: the caught creatures' screen, whose cursor is the first
+/// row it shows, has nothing to point at.
+pub fn spots(
+    menu: &PlayerMenu,
+    entries: [&[Vec<Piece>]; 2],
+    (items, story): (&[Vec<Piece>], &[Vec<Piece>]),
+    [spell_lines, attack_lines]: [&[Vec<Piece>]; 2],
+) -> Vec<(Spot, Rect)> {
+    let spot = |rows: Vec<(i16, Rect)>| -> Vec<(Spot, Rect)> {
+        rows.into_iter().map(|(at, rect)| ((0, at), rect)).collect()
+    };
+    let lines = |lines: &[Vec<Piece>]| spot(line_rects(lines));
+    let rows = |lines: &[Vec<Piece>], starts: &[i16], first_row: i16, step: i16| {
+        spot(row_rects(lines, starts, first_row, step))
+    };
+    match menu.screen {
+        FIRST_LEVEL => {
+            let small = SMALL_BOXES.map(|(y, h)| rect(SMALL_BOX.0, y, SMALL_BOX.1, h));
+            let player = [LEFT_FRAME, RIGHT_FRAME].into_iter().chain(small);
+            let mut spots: Vec<(Spot, Rect)> = player.map(|rect| ((0, 0), rect)).collect();
+            let carried = usize::try_from(menu.carried).unwrap_or(0);
+            let (y, w, h) = CREATURE_BOX;
+            let places = creature_places(carried).iter().zip(0..);
+            spots.extend(places.map(|(&x, at)| ((1, at), rect(x, y, w, h))));
+            spots.push(((2, 0), THIRD_ROW));
+            spots
+        }
+        OF_PLAYER => lines(entries[0]),
+        OF_CREATURE => lines(entries[1]),
+        ITEMS => rows(items, &items::PIECES, items::FIRST_ROW, items::STEP),
+        STORY => rows(story, &story::PIECES, story::FIRST_ROW, story::STEP),
+        MAGIC => rows(
+            spell_lines,
+            &spells::PIECES,
+            spells::FIRST_ROW,
+            spells::STEP,
+        ),
+        SPECIAL => rows(
+            attack_lines,
+            &attacks::PIECES,
+            attacks::FIRST_ROW,
+            attacks::STEP,
+        ),
+        TARGET => {
+            let carried = usize::try_from(menu.carried.clamp(0, 3)).unwrap_or(0);
+            let rows: Vec<(usize, bool)> = (0..=carried).map(|target| (target, false)).collect();
+            spot(picker_rects(&rows))
+        }
+        LEAVE_FOREST => (0..2)
+            .map(|at| {
+                let x = story::ANSWER.x + story::ANSWER_STEP * at;
+                ((0, at), Rect { x, ..story::ANSWER })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Each line of a menu with the rectangle around its pieces, for a pointer of the
+/// build.
+pub fn line_rects(lines: &[Vec<Piece>]) -> Vec<(i16, Rect)> {
+    (lines.iter().zip(0..))
+        .filter_map(|(line, at)| {
+            crate::menu::bounds(line.iter().map(|piece| piece.rect)).map(|rect| (at, rect))
+        })
+        .collect()
+}
+
+/// Each row of a list the drawer places itself (the items, the things of the story, a
+/// creature's two lists) with the rectangle around its pieces, which start at `starts`
+/// across and `first_row` and `step` down: for a pointer of the build.
+pub fn row_rects(
+    lines: &[Vec<Piece>],
+    starts: &[i16],
+    first_row: i16,
+    step: i16,
+) -> Vec<(i16, Rect)> {
+    (lines.iter().zip(0..))
+        .filter_map(|(line, at)| {
+            let y = first_row + step * at;
+            let pieces = (line.iter().zip(starts)).map(|(piece, &x)| Rect { x, y, ..piece.rect });
+            crate::menu::bounds(pieces).map(|rect| (at, rect))
+        })
+        .collect()
+}
+
+/// Each row of the picker of a target ([`picker_rows`]) with its frame, for a pointer
+/// of the build.
+pub fn picker_rects(rows: &[(usize, bool)]) -> Vec<(i16, Rect)> {
+    let mut creatures = 0;
+    (rows.iter().zip(0..))
+        .map(|(&(target, _), at)| {
+            let y = match target {
+                0 => picker::NAME.y,
+                _ => {
+                    creatures += 1;
+                    picker::FIRST + picker::STEP * (creatures - 1)
+                }
+            };
+            (at, Rect { y, ..picker::NAME })
+        })
+        .collect()
 }
 
 /// The three counts of the small boxes: the empty cocoons, the caught creatures that
@@ -4714,6 +4822,37 @@ mod tests {
         assert_eq!(spell_at(bits, 3), spells::SPELLS);
         assert_eq!(spell_at(bits, -1), spells::SPELLS);
         assert_eq!((spells_known(0), spell_at(0, 0)), (0, spells::SPELLS));
+    }
+
+    #[test]
+    fn a_pointer_finds_the_rows_of_a_creatures_spells_and_body_attacks() {
+        let line = |pieces: &[(i16, i16)]| -> Vec<Piece> {
+            (pieces.iter())
+                .map(|&(x, w)| Piece {
+                    flags: 0,
+                    kind: kind::TEXT,
+                    value: 0,
+                    rect: rect(x, 0, w, 21),
+                    margin: (0, 4),
+                })
+                .collect()
+        };
+        let spells = vec![line(&[(0, 21), (0, 112)]); spells::ROWS];
+        let attacks = vec![line(&[(0, 38), (0, 93), (0, 78)]); attacks::ROWS];
+        let mut menu = PlayerMenu::open(&tables(), 1, 0);
+        let moves = [&spells[..], &attacks[..]];
+        menu.screen = MAGIC;
+        let found = spots(&menu, [&[], &[]], (&[], &[]), moves);
+        // Four rows of the spell's picture and its name, 22 apart from y 54.
+        assert_eq!(found.len(), spells::ROWS);
+        assert_eq!(found[1], ((0, 1), rect(96, 76, 133, 21)));
+        menu.screen = SPECIAL;
+        let found = spots(&menu, [&[], &[]], (&[], &[]), moves);
+        assert_eq!(found.len(), attacks::ROWS);
+        assert_eq!(found[4], ((0, 4), rect(56, 132, 209, 21)));
+        // The caught creatures' screen has nothing to point at.
+        menu.screen = CAUGHT;
+        assert!(spots(&menu, [&[], &[]], (&[], &[]), moves).is_empty());
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::options_view::{
     self, Parts, ThingLook, blit_lit, picture_in_row, scroll_signs, thing_looks,
 };
 use crate::place_map::picture;
+use crate::pointer::{self, Aim, Pointer};
 use crate::title::Press;
 
 /// The longest stretch of time one pass of the app may stand for.
@@ -99,6 +100,9 @@ pub struct ShopView {
     /// The keeper's face: the face of thing 1 of the room behind the screen.
     face: Option<Picture>,
     shown: Entity,
+    /// The row of the mouse and the wheel's notches on their way to the screen's
+    /// cursor (`pointer.rs`).
+    aim: Aim<shop_panel::Spot>,
 }
 
 /// What the screen brings in its own file and what its boxes are made of.
@@ -327,6 +331,7 @@ impl ShopView {
             look,
             face,
             shown,
+            aim: Aim::default(),
         })
     }
 
@@ -688,18 +693,30 @@ pub fn run_shop(
     current: Option<ResMut<ShopView>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     over_room: Query<Entity, With<OverTheRoom>>,
     mut things: Option<ResMut<crate::shown::Things>>,
     mut commands: Commands,
+    pointer: Pointer,
 ) {
     let Some(mut current) = current else {
         return;
     };
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    // The mouse over the rows of the state, and the wheel a row a pass.
+    let under = pointer.on_picture(current.shown, SCREEN);
+    let look = &current.look;
+    let lines = [
+        &look.first_lines[..],
+        &look.kind_lines[..],
+        &look.list_lines[..],
+    ];
+    let spots = shop_panel::spots(&current.screen, lines);
+    let under = pointer::row_under(spots, under);
+    current.aim.look(pointer.mouse(), under);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(PASSES_A_SECOND);
     let mut held = crate::keys::held(&keys);
@@ -723,12 +740,23 @@ pub fn run_shop(
         let passes = current.passes;
         let mut pad = current.pad.unwrap_or_default();
         pad.read(held, Repeat::of(GAME_FRAME), passes);
+        let view = &mut *current;
+        let here = shop_panel::here(&view.screen);
+        (view.aim).steer(&mut pad, here, |spot| shop_panel::way(&view.screen, spot));
         current.pad = Some(pad);
         let before = current.place();
         let current = &mut *current;
+        let money = current.carried.keeping.money();
         let pass = current
             .screen
             .pass(&current.wares, &mut current.carried, &pad);
+        // `money_multiplier` (`assist.rs`): a sale brings more or less, and never more
+        // than the things cost to buy.
+        if let Some((thing, list, amount)) = pass.sold {
+            let cost = current.wares.price(thing, list).saturating_mul(amount);
+            let times = crate::assist::now().money;
+            crate::assist::given_money(&mut current.carried.keeping, money, times, Some(cost));
+        }
         for &sound in &pass.sounds {
             music.sound(sound.into());
         }

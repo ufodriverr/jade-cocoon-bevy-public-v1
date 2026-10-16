@@ -30,6 +30,9 @@ struct Drive {
     loudest: u16,
     /// The end was asked while it played (for the log, which names it once).
     ending: bool,
+    /// The game's clock ran fast while it played: its sound is skipped to its end
+    /// (`pace.rs`).
+    skipped: bool,
 }
 
 /// The voices of the game: the task, the disc, and the way to the sound device.
@@ -154,6 +157,7 @@ impl Voices {
                 owed: 0.0,
                 loudest: 0,
                 ending: false,
+                skipped: false,
             });
         }
         if let Some(volume) = pass.volume {
@@ -178,6 +182,26 @@ impl Voices {
                     ""
                 }
             );
+        }
+    }
+
+    /// The line that plays is skipped to its end: its sound is cut at once and no more
+    /// of it is heard (the game's clock runs fast).
+    fn skip(&mut self, commands: &mut Commands) {
+        let Some(drive) = self.drive.as_mut().filter(|drive| !drive.skipped) else {
+            return;
+        };
+        drive.skipped = true;
+        info!(
+            "voice: the clock runs fast, the line of channel {} from row {} is skipped from {:.2} s of its {:.2} s on",
+            drive.line.channel,
+            drive.line.start,
+            drive.played as f64 / f64::from(voice::RATE),
+            drive.line.seconds()
+        );
+        if let Some((line, player)) = self.line.take() {
+            line.close();
+            commands.entity(player).despawn();
         }
     }
 
@@ -213,10 +237,15 @@ impl Voices {
 }
 
 /// Steps the task of the voices for the time gone by and puts the drive's sound on the
-/// line.
+/// line. The task goes by the game's clock, so a line lasts as many game frames whatever
+/// the clock's speed; while the clock runs fast (`pace.rs`) its sound could only keep
+/// step at a higher pitch, so a line that plays then is cut and the rest of it skipped,
+/// and the next line is heard again when the clock is back at its speed. The line is
+/// heard at the volumes of a PC (`audio.rs`).
 pub fn play_voices(
     mut voices: ResMut<Voices>,
-    time: Res<Time>,
+    time: Res<Time<Virtual>>,
+    loudness: Res<crate::audio::Loudness>,
     mut sounds: ResMut<Assets<MovieSound>>,
     mut commands: Commands,
 ) {
@@ -230,18 +259,26 @@ pub fn play_voices(
         line.close();
         commands.entity(player).despawn();
     }
-    let seconds = time.delta_secs_f64().min(LONGEST_PASS);
+    let seconds = crate::pace::passed(&time, LONGEST_PASS);
+    let fast = time.effective_speed_f64() > 1.0;
+    if fast {
+        voices.skip(&mut commands);
+    }
     voices.owed += seconds * PASSES_A_SECOND;
     while voices.owed >= 1.0 {
         voices.owed -= 1.0;
         voices.pass();
+        if fast {
+            voices.skip(&mut commands);
+        }
         // The sound of this pass of the task, at its volume.
         let out = voices.sound(1.0 / PASSES_A_SECOND);
-        if out.is_empty() {
+        let skipped = (voices.drive.as_ref()).is_none_or(|drive| drive.skipped);
+        if out.is_empty() || skipped {
             continue;
         }
         let (line, _) = voices.line.get_or_insert_with(|| {
-            let line = Line::new(voice::RATE);
+            let line = Line::with_gain(voice::RATE, &loudness.voices);
             let player = AudioPlayer(sounds.add(MovieSound(line.clone())));
             (line, commands.spawn(player).id())
         });

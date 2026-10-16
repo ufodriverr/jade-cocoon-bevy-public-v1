@@ -74,7 +74,7 @@ pub fn run_chapter(
     game: Option<Res<crate::Game>>,
     movies: Res<ScriptMovies>,
     mut music: ResMut<Music>,
-    time: Res<Time>,
+    time: Res<Time<Virtual>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -128,7 +128,7 @@ pub fn run_chapter(
         return;
     };
     // The last state counts down once a pass and goes on when the counter is below zero.
-    screen.owed += time.delta_secs_f64().min(LONGEST_PASS) * PASSES_A_SECOND;
+    screen.owed += crate::pace::passed(&time, LONGEST_PASS) * PASSES_A_SECOND;
     let mut counter = counter;
     while screen.owed >= 1.0 && counter >= 0 {
         screen.owed -= 1.0;

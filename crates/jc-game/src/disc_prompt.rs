@@ -53,13 +53,31 @@ pub fn ensure() -> Result<(), String> {
                     .pick_file()
             })
             .flatten()
-            .ok_or("no disc image was chosen")?;
+            .ok_or(GIVEN_UP)?;
         match LocalConfig::disc_problem(&image) {
             Some(wrong) => why = wrong,
             None => return store(&start, &image),
         }
     }
 }
+
+/// What was given up: why the start goes no further. The person who said no needs no
+/// window for it; any other reason is said in one, since a release exe has no console
+/// to print it in.
+pub fn cannot_start(err: &str) {
+    if err == GIVEN_UP {
+        return;
+    }
+    MessageDialog::new()
+        .set_title(TITLE)
+        .set_level(MessageLevel::Error)
+        .set_description(format!("Jade Cocoon cannot start:\n\n{err}"))
+        .set_buttons(MessageButtons::Ok)
+        .show();
+}
+
+/// The error of a person who chose no disc image.
+const GIVEN_UP: &str = "no disc image was chosen";
 
 /// Stores a good image and looks whether a start reads it now: a `jc.local.toml` that
 /// is broken in another line still stops it.

@@ -82,6 +82,7 @@ pub mod tim;
 pub mod tint;
 pub mod title;
 pub mod toll;
+pub mod versus;
 pub mod voice;
 pub mod vram;
 pub mod warp;

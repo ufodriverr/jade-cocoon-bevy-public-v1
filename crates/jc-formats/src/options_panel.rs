@@ -262,6 +262,112 @@ fn colours(screen: &OptionsScreen, time: u32) -> Vec<Drawn> {
     drawn
 }
 
+/// The value of each row of a page with answers, which is the cursor of its answers.
+fn values(screen: &OptionsScreen, settings: &Settings) -> Vec<i16> {
+    let bytes = screen.bytes;
+    match screen.page {
+        AUDIO => vec![
+            settings.music().into(),
+            settings.effects().into(),
+            bytes.output.into(),
+        ],
+        SUBTITLES => vec![
+            bytes.display.into(),
+            i16::from(bytes.anim_cut != [0, 0]),
+            bytes.speech.into(),
+            bytes.auto_play.into(),
+            bytes.subtitles.into(),
+            bytes.magic_fx.into(),
+            bytes.capture_fx.into(),
+        ],
+        VIBRATION => vec![bytes.vibration.into()],
+        _ => Vec::new(),
+    }
+}
+
+/// A place of the screen's cursors, as a pointer of the build names it (the game has
+/// none): a row of the page, or while one is picked an answer of that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    Row(i16),
+    Answer(i16),
+}
+
+/// The spot the cursor is on.
+pub fn here(screen: &OptionsScreen, settings: &Settings) -> Spot {
+    let row = screen.cursor.at;
+    match screen.picking {
+        true => {
+            let values = values(screen, settings);
+            Spot::Answer(
+                usize::try_from(row)
+                    .ok()
+                    .and_then(|row| values.get(row))
+                    .copied()
+                    .unwrap_or(0),
+            )
+        }
+        false => Spot::Row(row),
+    }
+}
+
+/// Where the spots of the page lie, each with a rectangle that shows it: a row is its
+/// label and its answers, and while a row is picked its answers are spots of their own.
+/// A refusal has none.
+pub fn spots(screen: &OptionsScreen, lines: &Lines) -> Vec<(Spot, Rect)> {
+    let row = screen.cursor.at;
+    let around = |line: &Vec<Piece>| crate::menu::bounds(line.iter().map(|piece| piece.rect));
+    let of = |lines: &[Vec<Piece>], spot: fn(i16) -> Spot| -> Vec<(Spot, Rect)> {
+        (lines.iter().zip(0..))
+            .filter_map(|(line, n)| around(line).map(|rect| (spot(n), rect)))
+            .collect()
+    };
+    let page = |labels: &[Vec<Piece>], answers: &[Vec<Vec<Piece>>]| -> Vec<(Spot, Rect)> {
+        let picked = usize::try_from(row).ok().filter(|_| screen.picking);
+        match picked.and_then(|row| answers.get(row)) {
+            Some(answers) => of(answers, Spot::Answer),
+            None => {
+                let mut spots = of(labels, Spot::Row);
+                for (lines, n) in answers.iter().zip(0..) {
+                    let rect = crate::menu::bounds(lines.iter().filter_map(around));
+                    spots.extend(rect.map(|rect| (Spot::Row(n), rect)));
+                }
+                spots
+            }
+        }
+    };
+    match screen.page {
+        _ if screen.refusal != 0 || !screen.up => Vec::new(),
+        FIRST => of(&lines.first, Spot::Row),
+        AUDIO => page(&lines.audio_labels, &lines.audio_answers),
+        SUBTITLES => page(&lines.subtitle_labels, &lines.subtitle_answers),
+        VIBRATION => page(
+            &lines.vibration_label,
+            std::slice::from_ref(&lines.vibration_answers),
+        ),
+        COLOUR => (0..COLOURS)
+            .flat_map(|colour| {
+                let lower = |rect: Rect| Rect {
+                    y: rect.y + COLOUR_STEP * colour,
+                    ..rect
+                };
+                [COLOUR_MARK, COLOUR_BOX].map(|rect| (Spot::Row(colour), lower(rect)))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The directions that bring the cursor a step nearer to a spot: the rows' cursor
+/// moves over the rows, and the answers of a picked row lie side by side.
+pub fn way(screen: &OptionsScreen, here: Spot, to: Spot) -> u16 {
+    match (here, to) {
+        (Spot::Row(_), Spot::Row(row)) => screen.cursor.way_to(row),
+        (Spot::Answer(at), Spot::Answer(value)) => crate::menu::way(i16::MAX, at, value),
+        _ => 0,
+    }
+}
+
 /// What the screen draws in a pass (`0x800C3158`, `0x800C47F0` while an answer is
 /// picked and `0x800C4D3C` while a refusal is up), from what lies underneath to what
 /// lies on top: the heading, the page, and the line of help or the box of a refusal.
@@ -305,11 +411,7 @@ pub fn drawn(
             |_| false,
         )),
         AUDIO => {
-            let values = [
-                settings.music().into(),
-                settings.effects().into(),
-                bytes.output.into(),
-            ];
+            let values = values(screen, settings);
             drawn.extend(page(
                 screen,
                 &lines.audio_labels,
@@ -321,15 +423,7 @@ pub fn drawn(
             ));
         }
         SUBTITLES => {
-            let values = [
-                bytes.display.into(),
-                i16::from(bytes.anim_cut != [0, 0]),
-                bytes.speech.into(),
-                bytes.auto_play.into(),
-                bytes.subtitles.into(),
-                bytes.magic_fx.into(),
-                bytes.capture_fx.into(),
-            ];
+            let values = values(screen, settings);
             // The dim labels are set while no answer is picked and stay as they are
             // while one is, when the bytes are still what the settings gave.
             let set = if screen.picking {

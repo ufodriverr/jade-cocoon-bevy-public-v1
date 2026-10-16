@@ -23,6 +23,13 @@ pub struct PlayClock {
 }
 
 impl PlayClock {
+    /// `seconds` of the game's clock in this frame were never played: the skip of a
+    /// scene drops the game frames it has no time for (`skip.rs`), which [`count`]
+    /// would count otherwise.
+    pub fn unplayed(&mut self, seconds: f64) {
+        self.owed -= seconds * f64::from(REFRESHES_A_SECOND);
+    }
+
     /// The reset of "Start Game".
     pub fn start(&mut self) {
         *self = Self::default();
@@ -50,6 +57,8 @@ pub struct Loaded {
     /// He stands on the room's default place, not on the one of `stands`: the start
     /// of a second round.
     pub default_place: bool,
+    /// The game feel kept beside the save (`prefs.rs`); nothing for a save without it.
+    pub feel: Option<crate::prefs::GameFeel>,
 }
 
 #[derive(Resource)]
@@ -81,6 +90,8 @@ impl SecondRound {
             room: Some(jc_formats::title::SECOND_ROUND_ROOM),
             name,
             default_place: true,
+            // The load in front of the second round took it already.
+            feel: None,
         }
     }
 }
@@ -88,7 +99,7 @@ impl SecondRound {
 /// Counts the refreshes of the time gone by.
 pub fn count(time: Res<Time>, mut clock: ResMut<PlayClock>) {
     clock.owed += time.delta_secs_f64() * f64::from(REFRESHES_A_SECOND);
-    let whole = clock.owed.floor();
+    let whole = clock.owed.floor().max(0.0);
     clock.owed -= whole;
     clock.refreshes = clock.refreshes.wrapping_add(whole as u32);
 }
@@ -172,10 +183,20 @@ fn memory(
 /// The buffer of a save of a new game that was given no name, with a place without
 /// letters: what the check of the memory card screen saves (`--card`).
 pub(crate) fn new_game(settings: jc_formats::options_screen::Settings) -> Result<Vec<u8>, Failure> {
+    of_a_game(settings, &Carried::new_game())
+}
+
+/// The buffer of a save of `carried` as a new game of no name has the rest, written as
+/// the memory card screen writes a save: the check of the fight of two players makes the
+/// saves of its teams with it (`--write-versus-saves=`).
+pub(crate) fn of_a_game(
+    settings: jc_formats::options_screen::Settings,
+    carried: &Carried,
+) -> Result<Vec<u8>, Failure> {
     let disc = Disc::read()?;
     let beside = Beside::new_game(settings, [0; name::LETTERS]);
     let mut buffer = vec![0; jc_formats::card_screen::BUFFER];
-    let made = memory(&Carried::new_game(), &beside, None, &disc)?;
+    let made = memory(carried, &beside, None, &disc)?;
     if !made.write(&mut buffer, &[0; 24], &disc.fixed) || !disc.file_head.write(&mut buffer) {
         return Err("the buffer is too short for a save".into());
     }
@@ -243,17 +264,30 @@ impl Running {
     }
 }
 
+impl Running {
+    /// The buffer of a save of the running game, as the writer makes it for the memory
+    /// card screen; the build's quick save and autosave write the same (`quick.rs`).
+    pub fn buffer(&self) -> Result<Vec<u8>, Failure> {
+        let mut buffer = vec![0; jc_formats::card_screen::BUFFER];
+        let memory = self.memory()?;
+        if !memory.write(&mut buffer, &self.place, &self.disc.fixed)
+            || !self.disc.file_head.write(&mut buffer)
+        {
+            return Err("the buffer is too short for a save".into());
+        }
+        Ok(buffer)
+    }
+}
+
 impl jc_formats::card_screen::Game for Running {
     fn write(&mut self) -> Vec<u8> {
-        let mut buffer = vec![0; jc_formats::card_screen::BUFFER];
-        match self.memory() {
-            Ok(memory) => {
-                memory.write(&mut buffer, &self.place, &self.disc.fixed);
-                self.disc.file_head.write(&mut buffer);
+        match self.buffer() {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                error!("the memory card screen: the game is not saved: {err}");
+                vec![0; jc_formats::card_screen::BUFFER]
             }
-            Err(err) => error!("the memory card screen: the game is not saved: {err}"),
         }
-        buffer
     }
 
     fn read(&mut self, buffer: &[u8]) -> bool {
@@ -268,6 +302,7 @@ impl jc_formats::card_screen::Game for Running {
             error!("the memory card screen: the save has no variant table, it is not taken");
             return false;
         }
+        carried.corridor = None;
         let beside = Beside::read_block(&memory.block);
         // The word of the place is the loaded game's from here on.
         carried.place_word = beside.place;
@@ -288,6 +323,8 @@ impl jc_formats::card_screen::Game for Running {
             stands,
             room,
             default_place: false,
+            // The screen puts in what lies beside the save's file (`card_view.rs`).
+            feel: None,
         });
         true
     }
@@ -390,5 +427,29 @@ pub fn check(
     match said(&carried, &beside, room) {
         Ok(said) => info!("a save of this moment: {said}"),
         Err(err) => error!("a save of this moment: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_frames_a_skip_dropped_are_not_played() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<PlayClock>()
+            .add_systems(Update, count);
+        // Ten seconds on the clock of which a skip ran only two.
+        app.world_mut().resource_mut::<PlayClock>().unplayed(8.0);
+        (app.world_mut().resource_mut::<Time>()).advance_by(std::time::Duration::from_secs(10));
+        app.update();
+        let refreshes = app.world().resource::<PlayClock>().refreshes;
+        assert_eq!(refreshes, 2 * REFRESHES_A_SECOND);
+        // Dropped time that is not paid back yet counts nothing, and is paid back later.
+        app.world_mut().resource_mut::<PlayClock>().unplayed(1.0);
+        (app.world_mut().resource_mut::<Time>()).advance_by(std::time::Duration::ZERO);
+        app.update();
+        assert_eq!(app.world().resource::<PlayClock>().refreshes, refreshes);
     }
 }

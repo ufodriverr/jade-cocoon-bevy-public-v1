@@ -60,16 +60,16 @@ const FULL: i16 = 1000;
 const CAME_IN: i16 = 800;
 /// The third slot's thing that regenerates, and the status bits of a turn's start.
 const REGENERATING_THING: u8 = 16;
-const LAST_STONE: u32 = 0x0200;
+pub(super) const LAST_STONE: u32 = 0x0200;
 const REGENERATION: u32 = 0x4000;
-const UNABLE: u32 = 0x10000;
+pub(super) const UNABLE: u32 = 0x10000;
 /// The bits that, newly given by an action, make the second runner show the status.
-const SHOWN_WHEN_GIVEN: u32 = 0x18202;
+pub(super) const SHOWN_WHEN_GIVEN: u32 = 0x18202;
 /// The bad statuses, and the one item that may be aimed at the dead.
 const BAD: u32 = 0x07FB;
 const REVIVES: usize = 13;
 /// The command kinds the result records name.
-mod kind {
+pub(super) mod kind {
     pub const ATTACK: u32 = 0;
     pub const SPELL: u32 = 1;
     pub const SUMMON: u32 = 2;
@@ -115,7 +115,7 @@ pub mod took {
     pub const A_MESSAGE: u32 = 3;
 }
 
-fn shaken(actor: usize, own: (i32, i32), decided: &[(usize, Resolved, u8)]) -> u8 {
+pub(super) fn shaken(actor: usize, own: (i32, i32), decided: &[(usize, Resolved, u8)]) -> u8 {
     let mut shakes = u8::from(own.0 > 0 || own.1 > 0) << actor;
     for &(slot, result, _) in decided {
         let shaken = match result.outcome {
@@ -130,7 +130,7 @@ fn shaken(actor: usize, own: (i32, i32), decided: &[(usize, Resolved, u8)]) -> u
     shakes
 }
 
-fn flashed(decided: &[(usize, Resolved, u8)]) -> u8 {
+pub(super) fn flashed(decided: &[(usize, Resolved, u8)]) -> u8 {
     let mut flashes = 0;
     for &(slot, result, _) in decided {
         let critical = result.outcome == outcome::CRITICAL;
@@ -142,7 +142,7 @@ fn flashed(decided: &[(usize, Resolved, u8)]) -> u8 {
 /// The sound of a command's targets (`0x800BF108`, the cases of the result's kind): a
 /// target that lost HP or MP by a hit, one that was hit critically and one that was
 /// missed each write the half word, in slot order, so the last of them is heard.
-fn heard(decided: &[(usize, Resolved, u8)]) -> Option<u32> {
+pub(super) fn heard(decided: &[(usize, Resolved, u8)]) -> Option<u32> {
     let of = |&(_, result, _): &(usize, Resolved, u8)| match result.outcome {
         outcome::HIT | outcome::MP_HIT | outcome::HP_AND_MP if result.hp > 0 || result.mp > 0 => {
             Some(sound::HIT_SOUND)
@@ -158,7 +158,11 @@ fn heard(decided: &[(usize, Resolved, u8)]) -> Option<u32> {
 /// [`shaken`] goes by it): a hit counts the HP change, an MP hit the MP change, both
 /// count both, and a critical hit a task of way 2 and the HP change. The actor's kind
 /// says which of its own changes of a drain are not zero.
-fn counted(actor: usize, own: (i32, i32), decided: &[(usize, Resolved, u8)]) -> Vec<Counted> {
+pub(super) fn counted(
+    actor: usize,
+    own: (i32, i32),
+    decided: &[(usize, Resolved, u8)],
+) -> Vec<Counted> {
     let mut shown = [(outcome::NOTHING, 0, 0); SLOTS];
     shown[actor] = match own {
         (0, 0) => shown[actor],
@@ -197,7 +201,12 @@ impl Run {
     /// slot, without targets. The start of the turn has made the slot's shown kind of
     /// its own two words (`0x800BB5B0`), so the slot starts the tasks of that kind at
     /// its delay too, with the entries of the change tables, which are 0.
-    fn of_reaction(slot: usize, reaction: u8, (hp, mp): (i32, i32), player_fell: bool) -> Self {
+    pub(super) fn of_reaction(
+        slot: usize,
+        reaction: u8,
+        (hp, mp): (i32, i32),
+        player_fell: bool,
+    ) -> Self {
         let empty = |way: u8| Counted {
             slot,
             way,
@@ -225,6 +234,80 @@ impl Run {
             camera: None,
             sounds: Sounds::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Ticked {
+    /// The status word before and after.
+    pub old: u32,
+    pub new: u32,
+    /// The change the tick brings, a loss above 0: what its reaction's runner applies.
+    pub hp: i32,
+    pub mp: i32,
+    pub reaction: u8,
+    /// The fighter falls: the last stone step, or a loss of all its HP.
+    pub falls: bool,
+    /// The turn is lost (still asleep, or unable) and the change is not applied.
+    pub lost: bool,
+}
+
+/// The status tick of a turn's start on a record: the stone group moves up, poison,
+/// regeneration and the end of a defence count, and one draw decides whether a sleeper
+/// wakes. The new status word is written; the HP and MP change is only answered.
+pub(super) fn tick(record: &mut Record, draws: &mut impl Draws) -> Ticked {
+    let old = record.status;
+    // The group moves up as a whole (`0x800BFC04`): the last step would become the
+    // dead bit, but nobody starts a turn alive with the last step.
+    let mut new = old & !status::STONE | (old & status::STONE) << 1;
+    if record.equipment[2] == REGENERATING_THING {
+        new |= REGENERATION;
+    }
+    let (mut hp, mut mp) = (0, 0);
+    if old & status::POISON != 0 {
+        hp = i32::from(record.max_hp) / 10;
+        new &= !status::SLEEP;
+    } else if new & REGENERATION != 0 {
+        hp = -(i32::from(record.max_hp) / 20);
+    }
+    if old & status::DEFENDING != 0 {
+        mp = -(i32::from(record.level) / 4 + 3);
+        new &= !status::DEFENDING;
+    }
+    if new & LAST_STONE != 0 {
+        hp = record.hp.into();
+    }
+    if old & status::SLEEP != 0 && draws.draw() % 100 >= 77 {
+        new &= !status::SLEEP;
+    }
+    record.status = new;
+    let (set, newly, gone) = (new, new & !old, old & !new);
+    let reaction = if set & LAST_STONE != 0 {
+        reaction::STONE_DEATH
+    } else if newly & status::SLEEP != 0 {
+        reaction::SLEEPS
+    } else if newly & status::DEFENDING != 0 {
+        reaction::DEFENDS
+    } else if set & status::POISON != 0 {
+        reaction::HURT
+    } else if gone & status::SLEEP != 0 {
+        reaction::WAKES
+    } else if gone & status::DEFENDING != 0 {
+        reaction::STOPS_DEFENDING
+    } else if set & REGENERATION != 0 {
+        reaction::REGENERATES
+    } else {
+        reaction::NONE
+    };
+    let cannot = |bit: u32| old & new & bit != 0;
+    Ticked {
+        old,
+        new,
+        hp,
+        mp,
+        reaction,
+        falls: reaction == reaction::STONE_DEATH || hp >= i32::from(record.hp),
+        lost: cannot(status::SLEEP) || cannot(UNABLE),
     }
 }
 
@@ -934,55 +1017,19 @@ impl Fight {
         let Some(record) = self.records[slot].as_mut() else {
             return false;
         };
-        let old = record.status;
-        // The group moves up as a whole (`0x800BFC04`): the last step would become the
-        // dead bit, but nobody starts a turn alive with the last step.
-        let mut new = old & !status::STONE | (old & status::STONE) << 1;
-        if record.equipment[2] == REGENERATING_THING {
-            new |= REGENERATION;
-        }
-        let (mut hp, mut mp) = (0, 0);
-        if old & status::POISON != 0 {
-            hp = i32::from(record.max_hp) / 10;
-            new &= !status::SLEEP;
-        } else if new & REGENERATION != 0 {
-            hp = -(i32::from(record.max_hp) / 20);
-        }
-        if old & status::DEFENDING != 0 {
-            mp = -(i32::from(record.level) / 4 + 3);
-            new &= !status::DEFENDING;
-        }
-        if new & LAST_STONE != 0 {
-            hp = record.hp.into();
-        }
-        if old & status::SLEEP != 0 && draws.draw() % 100 >= 77 {
-            new &= !status::SLEEP;
-        }
-        record.status = new;
+        let Ticked {
+            old,
+            new,
+            hp,
+            mp,
+            reaction,
+            falls,
+            lost,
+        } = tick(record, draws);
         if new != old {
             self.ticked.push((slot, new));
         }
-        let (set, newly, gone) = (new, new & !old, old & !new);
-        let reaction = if set & LAST_STONE != 0 {
-            reaction::STONE_DEATH
-        } else if newly & status::SLEEP != 0 {
-            reaction::SLEEPS
-        } else if newly & status::DEFENDING != 0 {
-            reaction::DEFENDS
-        } else if set & status::POISON != 0 {
-            reaction::HURT
-        } else if gone & status::SLEEP != 0 {
-            reaction::WAKES
-        } else if gone & status::DEFENDING != 0 {
-            reaction::STOPS_DEFENDING
-        } else if set & REGENERATION != 0 {
-            reaction::REGENERATES
-        } else {
-            reaction::NONE
-        };
         self.began = reaction;
-        let falls = reaction == reaction::STONE_DEATH || hp >= i32::from(record.hp);
-        let cannot = |bit: u32| old & new & bit != 0;
         if falls {
             let reaction = match reaction {
                 reaction::STONE_DEATH => reaction,
@@ -1009,7 +1056,7 @@ impl Fight {
             self.leave_if_fallen(slot);
             return false;
         }
-        if cannot(status::SLEEP) || cannot(UNABLE) {
+        if lost {
             // The turn is lost and the tick's HP and MP change is not applied.
             self.events.push(Event::Lost { slot });
             self.director = turn + took::LOST;

@@ -43,7 +43,11 @@ impl Plugin for ModelViewPlugin {
             .resource_mut::<Assets<Shader>>()
             .insert(&MODEL_SHADER, shader)
             .expect("a fixed handle takes an asset");
-        app.add_plugins(MaterialPlugin::<ModelMaterial>::default());
+        app.add_plugins(MaterialPlugin::<ModelMaterial>::default())
+            .add_systems(
+                PostUpdate,
+                crate::display::keep_dither::<ModelMaterial>.after(crate::display::Fitting),
+            );
     }
 }
 
@@ -120,6 +124,16 @@ pub struct ModelMaterial {
 impl From<&ModelMaterial> for Mix {
     fn from(material: &ModelMaterial) -> Self {
         material.mix
+    }
+}
+
+impl crate::display::Dithers for ModelMaterial {
+    fn dither(&self) -> f32 {
+        self.share.w
+    }
+
+    fn set_dither(&mut self, dither: f32) {
+        self.share.w = dither;
     }
 }
 
@@ -841,7 +855,8 @@ fn material(surface: Surface, vram: &Vram, images: &mut Assets<Image>) -> ModelM
             TextureFormat::Rgba8Unorm,
             RenderAssetUsages::RENDER_WORLD,
         )),
-        share: Vec4::splat(mix.share()),
+        // The fourth share is the dither (`display::keep_dither`).
+        share: Vec3::splat(mix.share()).extend(0.0),
         mix,
     }
 }

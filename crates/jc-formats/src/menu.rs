@@ -192,6 +192,58 @@ impl Cursor {
     }
 }
 
+/// The directions that bring a cursor one step nearer to a place of its grid, the places
+/// counted row by row across `columns`: for a pointer of the build, which steers a
+/// cursor with the pad's own presses (the game has no pointer).
+pub fn way(columns: i16, at: i16, to: i16) -> u16 {
+    let columns = columns.max(1);
+    let (row, column) = (at.div_euclid(columns), at.rem_euclid(columns));
+    let (to_row, to_column) = (to.div_euclid(columns), to.rem_euclid(columns));
+    let up_down = match to_row.cmp(&row) {
+        std::cmp::Ordering::Less => pad::UP,
+        std::cmp::Ordering::Greater => pad::DOWN,
+        std::cmp::Ordering::Equal => 0,
+    };
+    let sideways = match to_column.cmp(&column) {
+        std::cmp::Ordering::Less => pad::LEFT,
+        std::cmp::Ordering::Greater => pad::RIGHT,
+        std::cmp::Ordering::Equal => 0,
+    };
+    up_down | sideways
+}
+
+impl Cursor {
+    /// The directions that bring the cursor a step nearer to a place of its grid
+    /// ([`way`]).
+    pub fn way_to(&self, to: i16) -> u16 {
+        way(self.columns, self.at, to)
+    }
+}
+
+/// The smallest rectangle around some rectangles, or none for none.
+pub fn bounds(rects: impl IntoIterator<Item = Rect>) -> Option<Rect> {
+    let mut rects = rects.into_iter();
+    let first = rects.next()?;
+    let edges = |rect: Rect| {
+        let (x, y) = (i32::from(rect.x), i32::from(rect.y));
+        [x, y, x + i32::from(rect.w), y + i32::from(rect.h)]
+    };
+    let [left, top, right, bottom] = rects.map(edges).fold(edges(first), |a, b| {
+        [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]
+    });
+    Some(Rect {
+        x: left as i16,
+        y: top as i16,
+        w: (right - left) as i16,
+        h: (bottom - top) as i16,
+    })
+}
+
 /// A rectangle of the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -649,6 +701,18 @@ mod tests {
             at,
             first: 0,
         }
+    }
+
+    #[test]
+    fn the_way_across_a_grid_mixes_the_row_and_the_column() {
+        assert_eq!(way(3, 0, 5), pad::DOWN | pad::RIGHT);
+        assert_eq!(way(3, 5, 3), pad::LEFT);
+        assert_eq!(way(1, 2, 0), pad::UP);
+        assert_eq!(way(2, 1, 1), 0);
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        let around = bounds([rect(83, 54, 18, 20), rect(216, 50, 20, 20)]);
+        assert_eq!(around, Some(rect(83, 50, 153, 24)));
+        assert_eq!(bounds([]), None);
     }
 
     #[test]

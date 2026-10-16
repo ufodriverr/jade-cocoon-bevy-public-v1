@@ -1,8 +1,12 @@
 
+use std::collections::VecDeque;
+
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::{ButtonState, InputSystems};
 use bevy::prelude::*;
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
 use jc_formats::menu::{self, Frames, Menu, Rect, Style};
-use jc_formats::name::{self, Area, Entry, Framed, LegendPiece, Page, Tables};
+use jc_formats::name::{self, Area, Entry, Framed, Page, Tables, Typed};
 use jc_formats::pad::{Pad, Repeat};
 use jc_formats::rooms;
 use jc_formats::text::{self, Font, Fonts, Glyph};
@@ -12,6 +16,8 @@ use jc_formats::title;
 
 use crate::movie_view::{Playing, ShowMovie};
 use crate::music::Music;
+use crate::pointer::{self, Aim, Mouse, Pointer};
+use crate::prompts::{self, Laid};
 use crate::title::Press;
 
 /// The console's screen.
@@ -99,6 +105,11 @@ pub struct NameEntry {
     /// The game frames a pass of the screen's task stands for, which the menus' time
     /// counts: 1 under the title, 2 over a room.
     game_frame: u32,
+    /// The spot of the mouse on its way to the cursor (`pointer.rs`), the characters a
+    /// keyboard types with what each one is, and the keys typed that wait for a pass.
+    aim: Aim<name::Spot>,
+    keyboard: Vec<(char, Typed)>,
+    typed: VecDeque<Typed>,
 }
 
 /// Mixes a colour into a pixel of the screen as the console blends, in five bits a part.
@@ -154,17 +165,9 @@ pub(crate) fn blit(
 }
 
 /// The letter of a unit for the log: the capitals, small letters and digits of the
-/// game's texts, a space, or a question mark for a sign.
+/// game's texts, a space, a sign a keyboard has, or a question mark for another sign.
 pub(crate) fn letter(unit: u16) -> char {
-    let [first, second] = unit.to_le_bytes();
-    let from = |start: u8, letter: u8| char::from(letter + (second - start));
-    match (first, second) {
-        (0x81, 0x40) => ' ',
-        (0x82, 0x4F..=0x58) => from(0x4F, b'0'),
-        (0x82, 0x60..=0x79) => from(0x60, b'A'),
-        (0x82, 0x81..=0x9A) => from(0x81, b'a'),
-        _ => '?',
-    }
+    name::key_of(unit).unwrap_or('?')
 }
 
 impl NameEntry {
@@ -259,7 +262,21 @@ impl NameEntry {
         self.passes += 1;
         let passes = self.passes;
         let before = self.state.clone();
-        let pass = self.state.pass(pad, &self.pages);
+        // A key typed on the keyboard is the pass's input in place of the pad's; else
+        // the mouse steers the cursor with the pad's own presses.
+        let pass = match self.typed.pop_front() {
+            Some(typed) => {
+                self.aim.forget();
+                info!("the name entry: pass {passes}: typed {typed:?}");
+                self.state.typed(typed, &self.pages)
+            }
+            None => {
+                let mut pad = *pad;
+                let state = &self.state;
+                (self.aim).steer(&mut pad, state.spot(), |spot| state.way_to(spot));
+                self.state.pass(&pad, &self.pages)
+            }
+        };
         for &sound in &pass.sounds {
             music.sound(sound.into());
         }
@@ -286,6 +303,31 @@ impl NameEntry {
         Some(stored)
     }
 
+    /// Once a frame: the mouse over the spots of the screen, at a pixel of it.
+    pub(crate) fn look(&mut self, mouse: &Mouse, at: Option<(i16, i16)>) {
+        let spots = name::spots(&self.state, &self.tables);
+        self.aim.look(mouse, pointer::row_under(spots, at));
+    }
+
+    /// Keys typed on the keyboard, for the passes to come: a character the grid does
+    /// not have is left out.
+    pub(crate) fn type_keys(&mut self, keys: impl IntoIterator<Item = Typing>) {
+        for key in keys {
+            let typed = match key {
+                Typing::Delete => Some(Typed::Delete),
+                Typing::Done => Some(Typed::Done),
+                Typing::Paste => None,
+                Typing::Character(typed) => (self.keyboard.iter())
+                    .find(|(key, _)| *key == typed)
+                    .map(|(_, letter)| *letter),
+            };
+            match typed {
+                Some(typed) => self.typed.push_back(typed),
+                None => info!("the name entry: the grid has no {key:?}"),
+            }
+        }
+    }
+
     /// The screen of this pass, four bytes a pixel. The slots of the ordering table are
     /// drawn from the last to the first, and in a slot what was added last comes first.
     pub(crate) fn paint(&self) -> Vec<u8> {
@@ -308,10 +350,11 @@ impl NameEntry {
             let sprite = self.sprites.get(number)?;
             Some((sprite.wide as i16, sprite.high as i16))
         };
-        for piece in (self.tables.legend_pieces(&self.font, sizes)).unwrap_or_default() {
+        for piece in prompts::legend(&self.tables.legend, &self.font, sizes, true) {
             match piece {
-                LegendPiece::Sign { sprite, at } => self.sprite(&mut screen, sprite, at, WHOLE),
-                LegendPiece::Word { units, at } => {
+                Laid::Sprite { sprite, at } => self.sprite(&mut screen, sprite, at, WHOLE),
+                Laid::Glyph { glyph, at } => prompts::put(&mut screen, &glyph, at, WHOLE),
+                Laid::Word { units, at } => {
                     let glyphs = self.font.glyphs(&self.font.codes(&units), at);
                     self.glyphs(&mut screen, false, &glyphs, WHOLE);
                 }
@@ -413,6 +456,9 @@ fn open(presses: Vec<Press>, shown: Entity) -> Result<NameEntry, Failure> {
         colour: 0,
         state: Entry::new(&font.codes(&default), 0),
         pages: tables.letters(&font),
+        keyboard: name::keyboard(&tables),
+        typed: VecDeque::new(),
+        aim: Aim::default(),
         tables,
         font,
         small,
@@ -445,6 +491,232 @@ pub(crate) fn open_on(
     Ok(entry)
 }
 
+/// A key typed on a name entry, before the screen has made a letter of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Typing {
+    Character(char),
+    /// Backspace.
+    Delete,
+    /// Enter.
+    Done,
+    /// Ctrl+V: the lobby's field of the room code takes the clipboard.
+    Paste,
+}
+
+/// What a key that went down types: Backspace and Enter (not with Alt, which is the
+/// switch of `display.rs`), else the characters of its text.
+pub fn typing(key: &Key, text: Option<&str>, alt: bool) -> Vec<Typing> {
+    match key {
+        Key::Backspace => vec![Typing::Delete],
+        Key::Enter if alt => Vec::new(),
+        Key::Enter => vec![Typing::Done],
+        Key::Character(typed) => {
+            let text = text.unwrap_or(typed.as_str());
+            (text.chars())
+                .filter(|letter| !letter.is_control())
+                .map(Typing::Character)
+                .collect()
+        }
+        Key::Space => vec![Typing::Character(' ')],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a key types on a name entry, so that it is not a button of the pad there:
+/// the letters, the digits, Space, the keys of signs and Backspace. The arrow keys,
+/// Enter, Esc, Tab and the keys that change nothing are not.
+pub fn typing_keys(key: KeyCode) -> bool {
+    use KeyCode::*;
+    let letter = matches!(
+        key,
+        KeyA | KeyB
+            | KeyC
+            | KeyD
+            | KeyE
+            | KeyF
+            | KeyG
+            | KeyH
+            | KeyI
+            | KeyJ
+            | KeyK
+            | KeyL
+            | KeyM
+            | KeyN
+            | KeyO
+            | KeyP
+            | KeyQ
+            | KeyR
+            | KeyS
+            | KeyT
+            | KeyU
+            | KeyV
+            | KeyW
+            | KeyX
+            | KeyY
+            | KeyZ
+    );
+    let digit = matches!(
+        key,
+        Digit0
+            | Digit1
+            | Digit2
+            | Digit3
+            | Digit4
+            | Digit5
+            | Digit6
+            | Digit7
+            | Digit8
+            | Digit9
+            | Numpad0
+            | Numpad1
+            | Numpad2
+            | Numpad3
+            | Numpad4
+            | Numpad5
+            | Numpad6
+            | Numpad7
+            | Numpad8
+            | Numpad9
+    );
+    let sign = matches!(
+        key,
+        Space
+            | Backspace
+            | Backquote
+            | Backslash
+            | BracketLeft
+            | BracketRight
+            | Comma
+            | Equal
+            | IntlBackslash
+            | IntlRo
+            | IntlYen
+            | Minus
+            | Period
+            | Quote
+            | Semicolon
+            | Slash
+            | NumpadAdd
+            | NumpadComma
+            | NumpadDecimal
+            | NumpadDivide
+            | NumpadMultiply
+            | NumpadSubtract
+    );
+    letter || digit || sign
+}
+
+/// Whether a name entry is up and takes the keyboard: the one of a new game, the one of
+/// the screen of the caught, or the lobby's (its name entry and its field of the
+/// address).
+pub fn naming(
+    entry: Option<&NameEntry>,
+    merge: Option<&crate::merge_view::MergeView>,
+    lobby: Option<&crate::lobby::Lobby>,
+) -> bool {
+    entry.is_some_and(|entry| !entry.over)
+        || merge.is_some_and(|merge| merge.names())
+        || lobby.is_some_and(|lobby| lobby.types())
+}
+
+/// The keyboard on a name entry, and the typing of a check run.
+pub struct TypingPlugin;
+
+impl Plugin for TypingPlugin {
+    fn build(&self, app: &mut App) {
+        // `--type=SECONDS:TEXT;...`: `<` is Backspace, `>` Enter and `^` Ctrl+V.
+        let checked = (std::env::args())
+            .find_map(|arg| arg.strip_prefix("--type=").map(TypedForACheck::of))
+            .unwrap_or_default();
+        app.insert_resource(checked)
+            .add_systems(PreUpdate, type_name.after(InputSystems));
+    }
+}
+
+/// What a check run types, by the second of the run from which on it is typed.
+#[derive(Resource, Debug, Default, Clone, PartialEq)]
+pub struct TypedForACheck(Vec<(f32, Vec<Typing>)>);
+
+impl TypedForACheck {
+    fn of(value: &str) -> Self {
+        let typed = (value.split(';'))
+            .filter_map(|part| {
+                let (second, text) = part.split_once(':')?;
+                let Ok(second) = second.trim().parse::<f32>() else {
+                    warn!("--type: {part:?} is not SECONDS:TEXT");
+                    return None;
+                };
+                let keys = (text.chars())
+                    .map(|letter| match letter {
+                        '<' => Typing::Delete,
+                        '>' => Typing::Done,
+                        '^' => Typing::Paste,
+                        letter => Typing::Character(letter),
+                    })
+                    .collect();
+                Some((second, keys))
+            })
+            .collect();
+        Self(typed)
+    }
+}
+
+/// The keys typed in this frame go to the name entry that is up.
+fn type_name(
+    mut keys: MessageReader<KeyboardInput>,
+    held: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Real>>,
+    mut checked: ResMut<TypedForACheck>,
+    entry: Option<ResMut<NameEntry>>,
+    merge: Option<ResMut<crate::merge_view::MergeView>>,
+    lobby: Option<ResMut<crate::lobby::Lobby>>,
+) {
+    let alt = held.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    let ctrl = held.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let mut typed: Vec<Typing> = (keys.read())
+        .filter(|key| key.state == ButtonState::Pressed)
+        .flat_map(|key| match ctrl && key.key_code == KeyCode::KeyV {
+            true => vec![Typing::Paste],
+            false => typing(&key.logical_key, key.text.as_deref(), alt),
+        })
+        .collect();
+    let (mut entry, mut merge, mut lobby) = (entry, merge, lobby);
+    // A check's text is typed once a name entry is up, from its second on.
+    let mut due = |typed: &mut Vec<Typing>| {
+        let second = time.elapsed_secs();
+        let due = (checked.0.iter()).position(|(from, _)| *from <= second);
+        if let Some(due) = due {
+            typed.extend(checked.0.remove(due).1);
+        }
+    };
+    if let Some(entry) = entry.as_deref_mut().filter(|entry| !entry.over) {
+        due(&mut typed);
+        if !typed.is_empty() {
+            entry.type_keys(typed);
+        }
+        return;
+    }
+    if let Some(naming) = (merge.as_deref_mut()).and_then(crate::merge_view::MergeView::naming_mut)
+    {
+        due(&mut typed);
+        if !typed.is_empty() {
+            naming.type_keys(typed);
+        }
+        return;
+    }
+    // The lobby's name entry, or its field of the address.
+    if let Some(lobby) = (lobby.as_deref_mut()).filter(|lobby| lobby.types()) {
+        due(&mut typed);
+        if typed.is_empty() {
+            return;
+        }
+        match lobby.naming_mut() {
+            Some(naming) => naming.type_keys(typed),
+            None => lobby.type_keys(typed),
+        }
+    }
+}
+
 /// `--name-entry`: the screen alone.
 pub fn show_name_entry(
     show: Res<ShowNameEntry>,
@@ -473,7 +745,7 @@ pub fn show_name_entry(
 }
 
 /// The pad's word of held buttons from the keyboard, or from the presses of a hidden run.
-fn buttons(current: &NameEntry, keys: &ButtonInput<KeyCode>) -> u16 {
+fn buttons(current: &NameEntry, keys: &crate::keys::Pad) -> u16 {
     let mut held = crate::keys::held(keys);
     for press in &current.presses {
         if press.holds(current.time) {
@@ -494,13 +766,13 @@ fn new_game(
     named: Option<Res<Named>>,
     second: Option<&crate::saving::SecondRound>,
     music: &mut Music,
-    time: &Time,
+    time: &Time<Virtual>,
     images: &mut Assets<Image>,
     commands: &mut Commands,
     exit: &mut MessageWriter<AppExit>,
 ) {
     if let Some(mut wait) = wait {
-        wait.owed += time.delta_secs_f64().min(LONGEST_PASS) * f64::from(title::PASSES_A_SECOND);
+        wait.owed += crate::pace::passed(time, LONGEST_PASS) * f64::from(title::PASSES_A_SECOND);
         while wait.owed >= 1.0 && wait.passes < title::LAST_WAIT {
             wait.owed -= 1.0;
             wait.passes += 1;
@@ -585,12 +857,13 @@ pub fn run_name_entry(
     second: Option<Res<crate::saving::SecondRound>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
+    pointer: Pointer,
 ) {
     let Some(mut current) = current else {
         new_game(
@@ -614,10 +887,12 @@ pub fn run_name_entry(
     if current.over {
         return;
     }
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(name::PASSES_A_SECOND);
     let held = buttons(&current, &keys);
+    let under = pointer.on_picture(current.shown, SCREEN);
+    current.look(pointer.mouse(), under);
     // The title's task clears the word of pressed buttons before it starts the screen,
     // and the pad routine has run in every pass before: a button that is still down from
     // the movie did not go down on the screen.
@@ -666,5 +941,76 @@ pub fn run_name_entry(
     if let Ok(mut sprite) = sprites.get_mut(current.shown) {
         let (wide, high) = (SCREEN.0 as u32, SCREEN.1 as u32);
         sprite.image = images.add(crate::picture_image(wide, high, current.paint()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_types_its_characters_backspace_deletes_and_enter_takes_the_name() {
+        let letter = Key::Character("a".into());
+        assert_eq!(typing(&letter, Some("A"), false), [Typing::Character('A')]);
+        assert_eq!(typing(&letter, None, false), [Typing::Character('a')]);
+        assert_eq!(
+            typing(&Key::Backspace, Some("\u{8}"), false),
+            [Typing::Delete]
+        );
+        assert_eq!(typing(&Key::Enter, Some("\r"), false), [Typing::Done]);
+        // Alt and Enter is the switch of the full screen.
+        assert!(typing(&Key::Enter, Some("\r"), true).is_empty());
+        assert_eq!(
+            typing(&Key::Space, Some(" "), false),
+            [Typing::Character(' ')]
+        );
+        assert!(typing(&Key::ArrowLeft, None, false).is_empty());
+        assert!(typing(&Key::Character("\t".into()), Some("\t"), false).is_empty());
+    }
+
+    #[test]
+    fn the_keys_that_type_are_no_buttons_on_a_name_entry() {
+        use KeyCode::*;
+        let typing = [
+            KeyW, KeyA, KeyS, KeyD, KeyF, KeyK, KeyX, KeyI, KeyJ, KeyL, KeyR, KeyC, KeyQ, KeyE,
+            KeyZ, KeyV, KeyU, KeyO, Space, Backspace, Digit7, Numpad3, Period, Comma, Minus,
+        ];
+        assert!(typing.into_iter().all(typing_keys));
+        let buttons = [
+            ArrowUp,
+            ArrowDown,
+            ArrowLeft,
+            ArrowRight,
+            Enter,
+            NumpadEnter,
+            Escape,
+            Tab,
+            ShiftLeft,
+            ControlLeft,
+            CapsLock,
+            F11,
+        ];
+        assert!(!buttons.into_iter().any(typing_keys));
+        // Only while a name entry is up.
+        assert!(!naming(None, None, None));
+    }
+
+    #[test]
+    fn a_check_types_its_text_with_backspace_and_enter() {
+        let typed = TypedForACheck::of("1.5:Ab<;3:>;x:y");
+        assert_eq!(
+            typed.0,
+            [
+                (
+                    1.5,
+                    vec![
+                        Typing::Character('A'),
+                        Typing::Character('b'),
+                        Typing::Delete
+                    ]
+                ),
+                (3.0, vec![Typing::Done]),
+            ]
+        );
     }
 }

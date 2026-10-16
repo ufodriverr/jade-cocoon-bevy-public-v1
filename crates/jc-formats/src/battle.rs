@@ -1,6 +1,7 @@
 
 pub mod ai;
 pub mod arena;
+pub mod duel;
 pub mod effects;
 pub mod fight;
 pub mod hud;

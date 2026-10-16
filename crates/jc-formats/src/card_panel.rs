@@ -1,6 +1,6 @@
 
 use crate::card_screen::{
-    ASKS_DELETE, CardScreen, HEAD, Routine, SLOTS, Shape, Tables, line, state,
+    ASKS_DELETE, CardScreen, EXTRA_NAMES, HEAD, Routine, SLOTS, Shape, Tables, line, state,
 };
 use crate::menu::{Menu, Rect, Style, kind, piece, placed, sign};
 use crate::text::{SMALL_FONT, TEXT_FONT};
@@ -38,6 +38,9 @@ pub const PLACE_NUMBER: i16 = 56;
 pub const MONEY_DIGIT: i16 = 7;
 pub const LEADING: i16 = 8;
 pub const DOTS: (i16, i16) = (2, 4);
+/// Where the name of a row of the build's above the slots starts in its row: the place
+/// of a save's kind of place, a little further left for the longer word.
+pub const EXTRA_NAME_AT: (i16, i16) = (252, 59);
 /// A message: the screen it is centred on, the lines' height in its size and on
 /// screen, and the frame's margins.
 pub const MESSAGE_SCREEN: (i16, i16) = (314, 234);
@@ -221,30 +224,51 @@ fn menu<'a>(
 
 /// The rows of the slots (`0x800B8EC0`), every piece cut to the rows' area. The game
 /// adds a row above the first and one below the last too, which the area cuts away
-/// whole; they are left out here.
+/// whole; they are left out here. A row of the build's above the slots
+/// ([`CardScreen::extra`]) has its name where a save's kind of place stands.
 fn rows<'a>(added: &mut Added<'a>, tables: &'a Tables, screen: &CardScreen) {
     const ENTRY: i32 = 1;
     let clip = Some(tables.area);
     let first = usize::try_from(screen.cursors[3].first).unwrap_or(0);
     for row in 0..ROWS {
         let slot = first + row as usize;
-        if slot >= SLOTS {
+        if slot >= screen.rows() {
             continue;
         }
         let low = ROW_STEP * row;
         let lower = |at: (i16, i16)| (at.0, at.1 + low);
+        // A row of the build's has its name, filled or not, so that an empty one is
+        // not taken for a slot without a save.
+        let extra_name = (slot < screen.extra)
+            .then(|| EXTRA_NAMES.get(slot))
+            .flatten();
+        let named = |added: &mut Added<'a>, units: &'a [u16]| {
+            let at = lower(EXTRA_NAME_AT);
+            let font = TEXT_FONT;
+            let text = Drawn::Text {
+                units,
+                font,
+                at,
+                clip,
+            };
+            added.add(ENTRY, text);
+        };
+        if !screen.is_read(slot) || !screen.filled[slot] {
+            let (number, at) = match screen.is_read(slot) {
+                true => NO_SAVE,
+                false => LOADING,
+            };
+            let at = lower(at);
+            added.add(ENTRY, Drawn::Sprite { number, at, clip });
+            if let Some(units) = extra_name {
+                named(added, units);
+            }
+            continue;
+        }
         let mut sprite = |number: usize, at: (i16, i16)| {
             let at = lower(at);
             added.add(ENTRY, Drawn::Sprite { number, at, clip });
         };
-        if !screen.is_read(slot) {
-            sprite(LOADING.0, LOADING.1);
-            continue;
-        }
-        if !screen.filled[slot] {
-            sprite(NO_SAVE.0, NO_SAVE.1);
-            continue;
-        }
         for label in &tables.labels {
             sprite(label.number as usize, label.at);
         }
@@ -289,13 +313,17 @@ fn rows<'a>(added: &mut Added<'a>, tables: &'a Tables, screen: &CardScreen) {
             let ends = (at.0 + PLACE_NUMBER, at.1);
             added.add(ENTRY, Drawn::Number { value, ends, clip });
         }
-        if let Some(kind) = usize::try_from(half(36))
+        let kind = usize::try_from(half(36))
             .ok()
-            .and_then(|k| tables.place_kinds.get(k))
-        {
-            let at = lower(kind.at);
-            let number = kind.number as usize;
-            added.add(ENTRY, Drawn::Sprite { number, at, clip });
+            .and_then(|k| tables.place_kinds.get(k));
+        match (extra_name, kind) {
+            (Some(units), _) => named(added, units),
+            (None, Some(kind)) => {
+                let at = lower(kind.at);
+                let number = kind.number as usize;
+                added.add(ENTRY, Drawn::Sprite { number, at, clip });
+            }
+            (None, None) => {}
         }
         let at = lower(tables.row[1]);
         let number = STROKE;
@@ -351,17 +379,20 @@ fn round_the_slots<'a>(added: &mut Added<'a>, tables: &'a Tables, screen: &CardS
         added.add(0, Drawn::Digits { value, ends, clip });
         added.frame(tables.frames[7]);
     }
+    // The number of the slot of the fifteen; a row of the build's above them has none.
     let number = |value: i32, ends: (i16, i16)| Drawn::Number { value, ends, clip };
-    added.add(5, number(screen.slot() as i32 + 1, NUMBER_ENDS[0]));
-    let (units, font, at) = (&tables.texts[7][..], SMALL_FONT, NUMBER_ENDS[0]);
-    let stroke = Drawn::Text {
-        units,
-        font,
-        at,
-        clip,
-    };
-    added.add(5, stroke);
-    added.add(5, number(SLOTS as i32, NUMBER_ENDS[1]));
+    if screen.slot() < SLOTS {
+        added.add(5, number(screen.slot() as i32 + 1, NUMBER_ENDS[0]));
+        let (units, font, at) = (&tables.texts[7][..], SMALL_FONT, NUMBER_ENDS[0]);
+        let stroke = Drawn::Text {
+            units,
+            font,
+            at,
+            clip,
+        };
+        added.add(5, stroke);
+        added.add(5, number(SLOTS as i32, NUMBER_ENDS[1]));
+    }
     added.frame(tables.frames[8]);
 }
 
@@ -397,6 +428,48 @@ fn ports<'a>(
         added.add(i32::from(sprite.slot), Drawn::Sprite { number, at, clip });
     }
     added.frame(tables.frames[3]);
+}
+
+/// For a pointer of the build (the game has none): the cursor record the state moves,
+/// and where its places lie, each with a rectangle that shows it. A port is the whole
+/// of its menu. None while a message is up or the screen does not take the pad.
+pub fn spots(tables: &Tables, screen: &CardScreen) -> Option<(usize, Vec<(i16, Rect)>)> {
+    if screen.routine != Routine::States || screen.message().is_some() {
+        return None;
+    }
+    let around =
+        |pieces: &[crate::menu::Piece]| crate::menu::bounds(pieces.iter().map(|piece| piece.rect));
+    let lines = |menu: &Menu| -> Vec<(i16, Rect)> {
+        (menu.lines.iter().zip(0..))
+            .filter_map(|(line, at)| around(line).map(|rect| (at, rect)))
+            .collect()
+    };
+    Some(match screen.state {
+        state::LIST => (0, lines(&tables.list)),
+        state::PORT => {
+            let ports = (tables.ports.iter().zip(0..)).filter_map(|(menu, port)| {
+                crate::menu::bounds(menu.lines.iter().filter_map(|line| around(line)))
+                    .map(|rect| (port, rect))
+            });
+            (1, ports.collect())
+        }
+        state::FORMAT => (2, lines(&tables.answers[0])),
+        state::SLOTS => {
+            // Only the rows that show a slot.
+            let first = screen.cursors[3].first;
+            let rows = lines(&tables.slots).into_iter();
+            (
+                3,
+                rows.filter(|(at, _)| {
+                    usize::try_from(first + at).is_ok_and(|row| row < screen.rows())
+                })
+                .collect(),
+            )
+        }
+        state::ASK | state::DELETE => (4, lines(&tables.answers[1])),
+        state::TITLE => (5, lines(&tables.answers[2])),
+        _ => return None,
+    })
 }
 
 /// A message (`0x800BAFA8`): its lines about the middle of the screen, in a frame.
@@ -490,7 +563,7 @@ pub fn drawn<'a>(
                 &tables.answers_words,
                 sizes,
             );
-            let filled = screen.filled.get(screen.slot()).copied().unwrap_or(false);
+            let filled = screen.filled.get(screen.row()).copied().unwrap_or(false);
             let text = match (screen.line(), filled) {
                 (line::LOAD, _) => Some(0),
                 (line::SAVE, true) => Some(1),

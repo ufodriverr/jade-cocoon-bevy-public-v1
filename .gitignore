@@ -3,6 +3,12 @@
 /cache/
 /re/
 /saves/
+/settings.toml
+/settings.*.toml
+/settings.toml.new
+/seen.toml
+/seen.toml.new
+/logs/
 /disc/
 /discs/
 /extracted/

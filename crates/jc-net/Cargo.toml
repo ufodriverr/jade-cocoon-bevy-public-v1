@@ -1,0 +1,17 @@
+[package]
+name = "jc-net"
+description = "The connection of the fight of two players: TCP or room code (iroh) lockstep and LAN discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+crossbeam-channel = { workspace = true }
+if-addrs = { workspace = true }
+igd-next = { workspace = true }
+iroh = { workspace = true }
+jc-disc = { workspace = true }
+jc-formats = { workspace = true }
+tokio = { workspace = true }

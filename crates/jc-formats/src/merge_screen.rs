@@ -420,20 +420,14 @@ pub fn has_lists(state: i16) -> bool {
     )
 }
 
-/// The record with nothing ailing it and all its HP and mana (`0x80011CD0`).
-fn whole(record: &mut Record) {
-    record.status = 0;
-    (record.hp, record.mp) = (record.max_hp, record.max_mp);
-}
-
 impl MergeScreen {
     /// The screen as its set-up leaves it (`0x800BB318`): the player, the caught
     /// creatures and the carried ones are made whole, the list is opened, which
     /// empties the game's own records, and the main menu is up.
     pub fn open(argument: i16, game: &mut Carried) -> Self {
         game.make_whole();
-        game.caught.each_mut().for_each(whole);
-        game.creatures.carried_mut().for_each(whole);
+        game.caught.each_mut().for_each(Record::make_whole);
+        game.creatures.carried_mut().for_each(Record::make_whole);
         let listed = Listed::open(&mut game.creatures, &mut game.caught);
         let mut cursor = Cursor {
             columns: 0,

@@ -534,8 +534,8 @@ pub fn run_results(
     current: Option<ResMut<ResultsView>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     over_room: Query<Entity, With<OverTheRoom>>,
@@ -548,7 +548,7 @@ pub fn run_results(
     if current.menu {
         return;
     }
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(PASSES_A_SECOND);
     let mut held = crate::keys::held(&keys);

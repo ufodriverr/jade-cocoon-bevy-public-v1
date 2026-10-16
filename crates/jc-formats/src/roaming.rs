@@ -295,7 +295,8 @@ impl Roaming {
         table.is_some()
     }
 
-    fn word_mut(&mut self, area: usize, place: usize, slot: i16) -> Option<&mut u16> {
+    /// The word of a room's slot, to change.
+    pub fn word_mut(&mut self, area: usize, place: usize, slot: i16) -> Option<&mut u16> {
         let slot = usize::try_from(slot).ok()?;
         self.words[Self::table(area, place)?].get_mut(slot)
     }

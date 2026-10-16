@@ -1,0 +1,6 @@
+Upstream package: enum-assoc 1.4.1
+Repository: https://github.com/Eolu/enum-assoc
+Declared licence: MIT OR Apache-2.0
+This package omitted a standalone licence file. The exact published manifest
+and standard licence text or same-project notices are retained here.
+No copyright year or copyright holder has been invented. See NOTICE-ORIGINS.json.

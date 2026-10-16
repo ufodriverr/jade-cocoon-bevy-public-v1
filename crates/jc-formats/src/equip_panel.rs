@@ -3,7 +3,7 @@ use crate::equip_screen::{EquipScreen, KIND, LIST, LIST_ROWS};
 use crate::items::FREE;
 use crate::menu::{Piece, Rect, Style, piece, sign};
 use crate::player_menu::OPEN;
-use crate::player_panel::{Drawn, five_numbers, four_lines, message, text_at, worn_rows};
+use crate::player_panel::{Drawn, detail, five_numbers, four_lines, message, text_at, worn_rows};
 
 /// The list of the three lines the list is drawn with, in the screen's file. The
 /// drawer writes the places of their pieces in every pass.
@@ -247,6 +247,61 @@ fn list(screen: &EquipScreen, shown: &Shown, time: u32) -> Vec<Drawn> {
     drawn
 }
 
+/// A place of the screen's cursor as a pointer of the build names it (the game has
+/// none): the step and the row of the cursor.
+pub type Spot = (i16, i16);
+
+/// The spot the cursor is on.
+pub fn here(screen: &EquipScreen) -> Spot {
+    (screen.step, screen.cursor.at)
+}
+
+/// The directions that bring the cursor a step nearer to a spot of its step.
+pub fn way(screen: &EquipScreen, (step, at): Spot) -> u16 {
+    match step == screen.step {
+        true => screen.cursor.way_to(at),
+        false => 0,
+    }
+}
+
+/// Where the spots of the step lie, each with a rectangle that shows it, for a pointer
+/// of the build: the three rows of what he has on while a kind is picked, and the rows
+/// of the list that hold a line. None under the message, nor behind the list, where
+/// the putting on has a row alone. `worn_lines` and `list_lines` are as in [`Shown`].
+pub fn spots(
+    screen: &EquipScreen,
+    worn_lines: &[Vec<Piece>],
+    list_lines: &[Vec<Piece>],
+) -> Vec<(Spot, Rect)> {
+    if screen.message || !screen.up {
+        return Vec::new();
+    }
+    let step = screen.step;
+    let on = |rows: Vec<(i16, Rect)>| -> Vec<(Spot, Rect)> {
+        rows.into_iter()
+            .map(|(at, rect)| ((step, at), rect))
+            .collect()
+    };
+    match step {
+        KIND => {
+            let starts = detail::WORN_PIECES.map(|x| WORN_AT.0 + x);
+            let rows =
+                crate::player_panel::row_rects(worn_lines, &starts, WORN_AT.1, detail::WORN_STEP);
+            on(rows.into_iter().take(detail::WORN.len()).collect())
+        }
+        LIST => {
+            let cursor = screen.cursor;
+            let shown = i32::from(cursor.lines) - i32::from(cursor.first);
+            let rows = crate::player_panel::row_rects(list_lines, &PIECES, FIRST_ROW, STEP);
+            on(rows
+                .into_iter()
+                .filter(|(at, _)| i32::from(*at) < shown)
+                .collect())
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// What the screen draws in a pass (`0x800C4C7C`, and `0x800C52D8` while the message
 /// is up), from what lies underneath to what lies on top: the message, added last;
 /// panel 1; panel 0, which is the list, or the description of what is on in the
@@ -345,6 +400,35 @@ mod tests {
             ],
             last_place: 1,
         }
+    }
+
+    #[test]
+    fn a_pointer_finds_the_rows_of_what_he_has_on_and_of_the_list() {
+        use crate::carried::Carried;
+        let worn = lines(&[(kind::PICTURE, 0, 50), (kind::PICTURE, 0, 21)], 3);
+        let list = lines(&[(kind::PICTURE, 83, 21), (kind::TEXT, 104, 112)], 3);
+        let mut screen = EquipScreen::open();
+        // The kinds: the three rows of what he has on, 22 apart from y 61.
+        let found = spots(&screen, &worn, &list);
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[2], ((KIND, 2), rect(10, 105, 71, 21)));
+        assert_eq!(here(&screen), (KIND, 0));
+        assert_eq!(way(&screen, (KIND, 2)), crate::pad::DOWN);
+        assert_eq!(way(&screen, (LIST, 2)), 0);
+        // The list of a kind: a row for each line it shows.
+        let mut carried = Carried::new_game();
+        let mut pad = crate::pad::Pad::default();
+        pad.read(crate::pad::CROSS, crate::pad::Repeat::of(1), 1);
+        screen.openness = OPEN;
+        screen.pass(&mut carried, &pad);
+        assert_eq!(screen.step, LIST);
+        let found = spots(&screen, &worn, &list);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[1], ((LIST, 1), rect(83, 159, 133, 21)));
+        // Nothing under the message.
+        screen.message = true;
+        assert!(spots(&screen, &worn, &list).is_empty());
     }
 
     fn frames(drawn: &[Drawn]) -> Vec<(Rect, u8, u32)> {

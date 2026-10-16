@@ -55,7 +55,7 @@ pub mod mode {
 }
 
 /// Where the cursor is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Area {
     /// The grid of letters.
     Grid = 0,
@@ -376,6 +376,138 @@ impl Entry {
     pub fn stored(&self, font: &Font, small: &Font) -> [u8; LETTERS] {
         stored(&font.units(self.name()), small)
     }
+
+    /// The spot the cursor is on, for a pointer of the build (the game has none).
+    pub fn spot(&self) -> Spot {
+        (self.area, self.cursor)
+    }
+
+    /// The directions that bring the cursor a step nearer to a spot: right goes on
+    /// from the grid to the pages and on to the commands, left back, and in an area
+    /// the directions of its grid.
+    pub fn way_to(&self, (area, at): Spot) -> u16 {
+        match area.cmp(&self.area) {
+            std::cmp::Ordering::Greater => pad::RIGHT,
+            std::cmp::Ordering::Less => pad::LEFT,
+            std::cmp::Ordering::Equal => menu::way(area.cells().columns, self.cursor, at),
+        }
+    }
+
+    /// A pass of the screen behind a key of a PC's keyboard (the game has none), in
+    /// place of the pad's: a letter puts the grid's cursor on its place and the cross
+    /// takes it, Backspace is the cancel in the grid, and Enter the cross on "Done".
+    /// The game's own pass does the rest, with its sounds.
+    pub fn typed(&mut self, typed: Typed, pages: &[Page]) -> Pass {
+        let button = match typed {
+            Typed::Letter { page, cell } => {
+                (self.area, self.page, self.cursor) = (Area::Grid, page, cell);
+                pad::CROSS
+            }
+            Typed::Delete => {
+                if self.area != Area::Grid {
+                    (self.area, self.cursor) = (Area::Grid, self.saved);
+                }
+                pad::TRIANGLE
+            }
+            Typed::Done => {
+                (self.area, self.cursor) = (Area::Commands, DONE);
+                pad::CROSS
+            }
+        };
+        let mut pad = Pad::default();
+        (pad.held, pad.pressed, pad.repeated) = (button, button, button);
+        self.pass(&pad, pages)
+    }
+}
+
+/// A place of the screen's cursors as a pointer of the build names it: the area and
+/// the place of its cursor.
+pub type Spot = (Area, i16);
+
+/// A key of a PC's keyboard on the screen ([`Entry::typed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Typed {
+    /// A letter of the grid: its page and its place there.
+    Letter { page: i16, cell: i16 },
+    /// Backspace: the last letter goes.
+    Delete,
+    /// Enter: the name is taken, unless it is blank.
+    Done,
+}
+
+/// The rectangle of a place of the grid: the frame of the cursor on it.
+pub fn cell_rect(at: i16) -> Rect {
+    let columns = Area::Grid.cells().columns;
+    Rect {
+        x: (GRID_AT.0 - 1).wrapping_add((at % columns).wrapping_mul(GRID_STEP.0)),
+        y: (GRID_AT.1 - 1).wrapping_add((at / columns).wrapping_mul(GRID_STEP.1)),
+        w: GRID_CURSOR,
+        h: GRID_CURSOR,
+    }
+}
+
+/// Where the spots of the screen lie, each with a rectangle that shows it, for a
+/// pointer of the build: every place of the grid (a blank one types a space, as with
+/// the pad), the lines of the pages' menu and of the commands' menu. None once the name
+/// is taken.
+pub fn spots(entry: &Entry, tables: &Tables) -> Vec<(Spot, Rect)> {
+    if entry.mode & mode::TAKEN != 0 {
+        return Vec::new();
+    }
+    let cells = Area::Grid.cells();
+    let grid = (0..cells.columns * cells.rows).map(|at| ((Area::Grid, at), cell_rect(at)));
+    let lines = |area: Area, menu: &Menu| -> Vec<(Spot, Rect)> {
+        (menu.lines.iter().zip(0..))
+            .filter_map(|(line, at)| {
+                menu::bounds(line.iter().map(|piece| piece.rect)).map(|rect| ((area, at), rect))
+            })
+            .collect()
+    };
+    let mut spots: Vec<(Spot, Rect)> = grid.collect();
+    spots.extend(lines(Area::Pages, &tables.page_menu));
+    spots.extend(lines(Area::Commands, &tables.command_menu));
+    spots
+}
+
+pub fn key_of(unit: u16) -> Option<char> {
+    let [first, second] = unit.to_le_bytes();
+    let from = |start: u8, letter: u8| char::from(letter + (second - start));
+    Some(match (first, second) {
+        (0x81, 0x40) => ' ',
+        (0x81, 0x43) => ',',
+        (0x81, 0x44 | 0x45) => '.',
+        (0x81, 0x46) => ':',
+        (0x81, 0x48) => '?',
+        (0x81, 0x49) => '!',
+        (0x81, 0x5B | 0x5D | 0x7C) => '-',
+        (0x81, 0x5E) => '/',
+        (0x81, 0x60) => '~',
+        (0x81, 0x66) => '\'',
+        (0x81, 0x95) => '&',
+        (0x82, 0x4F..=0x58) => from(0x4F, b'0'),
+        (0x82, 0x60..=0x79) => from(0x60, b'A'),
+        (0x82, 0x81..=0x9A) => from(0x81, b'a'),
+        _ => return None,
+    })
+}
+
+/// Each character a keyboard can type on the screen with the place of the grid that
+/// has it, its first place where several do: what [`Typed::Letter`] is made of.
+pub fn keyboard(tables: &Tables) -> Vec<(char, Typed)> {
+    let columns = Area::Grid.cells().columns;
+    let mut keys: Vec<(char, Typed)> = Vec::new();
+    for (rows, page) in tables.pages.iter().zip(0..) {
+        for (row, y) in rows.iter().zip(0..) {
+            for (&unit, x) in row.units.iter().zip(0..columns) {
+                let Some(key) = key_of(unit) else { continue };
+                if keys.iter().all(|(known, _)| *known != key) {
+                    let cell = y * columns + x;
+                    keys.push((key, Typed::Letter { page, cell }));
+                }
+            }
+        }
+    }
+    keys
 }
 
 /// The name of the game's state from a text: the low byte of each unit's code in the
@@ -489,14 +621,7 @@ pub const fn legend(kind: i16) -> Framed {
 
 /// The frame around the grid's letter under the cursor.
 pub fn grid_cursor(at: i16, kind: i16) -> Framed {
-    let columns = Area::Grid.cells().columns;
-    let rect = Rect {
-        x: (GRID_AT.0 - 1).wrapping_add((at % columns).wrapping_mul(GRID_STEP.0)),
-        y: (GRID_AT.1 - 1).wrapping_add((at / columns).wrapping_mul(GRID_STEP.1)),
-        w: GRID_CURSOR,
-        h: GRID_CURSOR,
-    };
-    framed(rect, kind, 1, true)
+    framed(cell_rect(at), kind, 1, true)
 }
 
 /// The pulsing frame behind the name's last letter: the place of the next one.
@@ -730,6 +855,190 @@ mod tests {
         (buttons.iter())
             .map(|&held| entry.pass(&down(held), &pages))
             .collect()
+    }
+
+    fn lines_menu(lines: Vec<Vec<crate::menu::Piece>>) -> Menu {
+        Menu {
+            flags: 0,
+            openness: 0,
+            cursor: 0,
+            slot: 0,
+            lines,
+        }
+    }
+
+    /// Passes on which the pad presses what [`Entry::way_to`] asks until the cursor is
+    /// on the spot, at most `most`: the spots the cursor stood on.
+    fn walk(entry: &mut Entry, to: Spot, most: usize) -> Vec<Spot> {
+        let pages = pages();
+        let mut seen = Vec::new();
+        for _ in 0..most {
+            if entry.spot() == to {
+                break;
+            }
+            let way = entry.way_to(to);
+            entry.pass(&down(way), &pages);
+            seen.push(entry.spot());
+        }
+        seen
+    }
+
+    #[test]
+    fn a_pointer_steers_the_cursor_between_the_grid_and_the_menus() {
+        let mut entry = Entry::new(&[], 0);
+        entry.cursor = 13;
+        // Across and down at once in the grid.
+        let seen = walk(&mut entry, (Area::Grid, 27), 8);
+        assert_eq!(seen, [(Area::Grid, 26), (Area::Grid, 27)]);
+        // Right along the row to the pages, which show the page the cursor is on, and
+        // on to the commands.
+        let seen = walk(&mut entry, (Area::Commands, DONE), 16);
+        assert_eq!(seen.last(), Some(&(Area::Commands, DONE)));
+        assert!(seen.contains(&(Area::Pages, 0)));
+        // Back: the grid has the place it was left at, and goes on from there.
+        let seen = walk(&mut entry, (Area::Grid, 0), 16);
+        assert_eq!(seen[..2], [(Area::Pages, 0), (Area::Grid, 35)]);
+        assert_eq!(seen.last(), Some(&(Area::Grid, 0)));
+        // The page's line of the menu turns the page.
+        walk(&mut entry, (Area::Pages, 1), 16);
+        assert_eq!((entry.area, entry.page), (Area::Pages, 1));
+    }
+
+    #[test]
+    fn the_spots_are_every_place_of_the_grid_and_the_menus_lines() {
+        let line = |y| {
+            vec![crate::menu::Piece {
+                flags: 0,
+                kind: 0,
+                value: 0,
+                rect: Rect {
+                    x: 220,
+                    y,
+                    w: 80,
+                    h: 16,
+                },
+                margin: (0, 0),
+            }]
+        };
+        let tables = Tables {
+            pages: Vec::new(),
+            cells: [Area::Grid.cells(); 3],
+            page_menu: lines_menu(vec![line(100), line(118)]),
+            command_menu: lines_menu(vec![line(150), line(168), line(186)]),
+            legend: Vec::new(),
+            dash: Vec::new(),
+            image: Vec::new(),
+        };
+        let mut entry = Entry::new(&[], 0);
+        let spots = spots(&entry, &tables);
+        assert_eq!(spots.len(), 72 + 2 + 3);
+        // The first and the last place of the grid lie under the cursor's frame.
+        assert_eq!(
+            spots[0],
+            (
+                (Area::Grid, 0),
+                Rect {
+                    x: 12,
+                    y: 99,
+                    w: 13,
+                    h: 13
+                }
+            )
+        );
+        let last = Rect {
+            x: 188,
+            y: 179,
+            w: 13,
+            h: 13,
+        };
+        assert_eq!(spots[71], ((Area::Grid, 71), last));
+        assert_eq!(spots[74].0, (Area::Commands, 0));
+        // A name that is taken has none.
+        entry.mode |= mode::TAKEN;
+        assert!(super::spots(&entry, &tables).is_empty());
+    }
+
+    #[test]
+    fn a_keyboard_types_letters_deletes_and_finishes_through_the_screens_pass() {
+        let pages = pages();
+        let mut entry = Entry::new(&[], 0);
+        entry.area = Area::Commands;
+        // A letter: the grid's cursor goes to its place and the cross takes it.
+        let pass = entry.typed(Typed::Letter { page: 0, cell: 5 }, &pages);
+        assert_eq!(pass.sounds, [SOUND_CONFIRM]);
+        assert_eq!(
+            (entry.area, entry.cursor, entry.name()),
+            (Area::Grid, 5, &[25][..])
+        );
+        entry.typed(Typed::Letter { page: 0, cell: 30 }, &pages);
+        assert_eq!(entry.name(), [25, 50]);
+        // Backspace takes the last letter, from a menu too.
+        entry.area = Area::Pages;
+        let pass = entry.typed(Typed::Delete, &pages);
+        assert_eq!((pass.sounds, entry.name()), (vec![SOUND_CANCEL], &[25][..]));
+        assert_eq!(entry.area, Area::Grid);
+        // Enter takes the name, but not a blank one.
+        let pass = entry.typed(Typed::Done, &pages);
+        assert!(pass.taken);
+        let mut blank = Entry::new(&[], 0);
+        let pass = blank.typed(Typed::Done, &pages);
+        assert!(!pass.taken && pass.sounds.is_empty());
+        assert_eq!(blank.spot(), (Area::Commands, DONE));
+    }
+
+    #[test]
+    fn a_key_is_the_letter_digit_or_sign_of_a_unit() {
+        let unit = |first: u8, second: u8| u16::from_le_bytes([first, second]);
+        let keys: String = [
+            unit(0x82, 0x60),
+            unit(0x82, 0x79),
+            unit(0x82, 0x81),
+            unit(0x82, 0x9A),
+            unit(0x82, 0x4F),
+            unit(0x82, 0x58),
+            unit(0x81, 0x40),
+            unit(0x81, 0x43),
+            unit(0x81, 0x45),
+            unit(0x81, 0x48),
+            unit(0x81, 0x49),
+            unit(0x81, 0x60),
+            unit(0x81, 0x5B),
+        ]
+        .into_iter()
+        .filter_map(key_of)
+        .collect();
+        assert_eq!(keys, "AZaz09 ,.?!~-");
+        assert_eq!(key_of(unit(0x83, 0x40)), None);
+        assert_eq!(key_of(unit(0x81, 0x97)), None);
+        // The keyboard has a key's first place in the grid.
+        let row = |units: Vec<u16>| Row {
+            at: (13, 100),
+            units,
+        };
+        let tables = Tables {
+            pages: vec![
+                vec![row(vec![
+                    unit(0x82, 0x60),
+                    unit(0x81, 0x40),
+                    unit(0x82, 0x60),
+                ])],
+                vec![row(vec![unit(0x81, 0x40)]), row(vec![unit(0x81, 0x49)])],
+            ],
+            cells: [Area::Grid.cells(); 3],
+            page_menu: lines_menu(Vec::new()),
+            command_menu: lines_menu(Vec::new()),
+            legend: Vec::new(),
+            dash: Vec::new(),
+            image: Vec::new(),
+        };
+        assert_eq!(
+            keyboard(&tables),
+            [
+                ('A', Typed::Letter { page: 0, cell: 0 }),
+                (' ', Typed::Letter { page: 0, cell: 1 }),
+                ('!', Typed::Letter { page: 1, cell: 12 }),
+            ]
+        );
     }
 
     #[test]

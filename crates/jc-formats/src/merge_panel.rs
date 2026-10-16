@@ -343,6 +343,133 @@ pub fn described(screen: &MergeScreen, shown: &Shown) -> Option<Listed> {
     }
 }
 
+/// A place of the screen's cursors as a pointer of the build names it (the game has
+/// none): the state, the part of the screen and the line there. The parts are
+/// [`part`]; a line of the kept is counted from the first of the list, so that it
+/// stays the same line while the list scrolls.
+pub type Spot = (i16, u8, i16);
+
+/// The parts of the screen a pointer finds a cursor's place in.
+pub mod part {
+    /// The rows of the screen's cursor that are not a list of creatures: the main
+    /// menu, the "Yes" and "No" of a question, the list of the minion skins.
+    pub const ROWS: u8 = 0;
+    /// The list of the carried and the list of the kept.
+    pub const CARRIED: u8 = 1;
+    pub const KEPT: u8 = 2;
+    /// The three frames of a merge, while their cursor is up.
+    pub const THREE: u8 = 3;
+}
+
+/// Whether the cursor of the three frames of a merge is up (`0x800BBE3C`).
+fn three_up(screen: &MergeScreen) -> bool {
+    screen.state == state::MERGE_ASKED && screen.flags & flag::MORE != 0
+}
+
+/// The spot the cursor is on.
+pub fn here(screen: &MergeScreen) -> Spot {
+    let cursor = screen.cursor;
+    let (part, line) = if three_up(screen) {
+        (part::THREE, screen.which.at)
+    } else if !crate::merge_screen::has_lists(screen.state) {
+        (part::ROWS, cursor.at)
+    } else if screen.flags & flag::IN_CARRIED != 0 {
+        (part::CARRIED, cursor.at)
+    } else {
+        (part::KEPT, cursor.first.wrapping_add(cursor.at))
+    };
+    (screen.state, part, line)
+}
+
+/// The directions that bring the cursor a step nearer to a spot of its state: down
+/// from the carried into the kept and up back, up and down along the kept, which
+/// scrolls on the way.
+pub fn way(screen: &MergeScreen, (state, to_part, line): Spot) -> u16 {
+    use crate::pad::{DOWN, UP};
+    let (here_state, part, at) = here(screen);
+    if state != here_state {
+        return 0;
+    }
+    let along = |at: i16| match line.cmp(&at) {
+        std::cmp::Ordering::Less => UP,
+        std::cmp::Ordering::Greater => DOWN,
+        std::cmp::Ordering::Equal => 0,
+    };
+    match (part, to_part) {
+        (part::THREE, part::THREE) => screen.which.way_to(line),
+        (part::ROWS, part::ROWS) | (part::CARRIED, part::CARRIED) => screen.cursor.way_to(line),
+        (part::KEPT, part::KEPT) => along(at),
+        (part::CARRIED, part::KEPT) => DOWN,
+        (part::KEPT, part::CARRIED) => UP,
+        _ => 0,
+    }
+}
+
+/// Where the spots of the state lie, each with a rectangle that shows it, for a
+/// pointer of the build: the rows of the main menu, the rows of the two lists, the
+/// "Yes" and "No" of a question, the three frames of a merge while their cursor is up,
+/// and the rows of the list of the minion skins that hold a line. None while a
+/// refusal, the keeper's second lines, the white of a yes or the look at a form is up,
+/// nor on a creature's pages (state 15), whose second cursor moves with the first.
+/// `lines` are the lines of the main menu, of the carried, of the kept and of the
+/// skins.
+pub fn spots(screen: &MergeScreen, lines: [&[Vec<Piece>]; 4]) -> Vec<(Spot, Rect)> {
+    let [main_lines, carried_lines, kept_lines, skin_lines] = lines;
+    let state = screen.state;
+    let asleep = screen.naming.is_some() || screen.away || screen.form.is_some();
+    if asleep || screen.refusal != 0 || screen.flags & flag::WHITE != 0 {
+        return Vec::new();
+    }
+    let on = |part: u8, rows: Vec<(i16, Rect)>| -> Vec<(Spot, Rect)> {
+        (rows.into_iter())
+            .map(|(line, rect)| ((state, part, line), rect))
+            .collect()
+    };
+    if three_up(screen) {
+        return on(part::THREE, (0..).zip(OF_THREE).collect());
+    }
+    if screen.flags & flag::MORE != 0 {
+        return Vec::new();
+    }
+    if crate::merge_screen::has_lists(state) {
+        let first = screen.scroll().max(0);
+        let kept = player_panel::line_rects(kept_lines).into_iter();
+        let mut spots = on(part::CARRIED, player_panel::line_rects(carried_lines));
+        spots.extend(on(
+            part::KEPT,
+            kept.map(|(row, rect)| (first + row, rect)).collect(),
+        ));
+        return spots;
+    }
+    if screen.panels & panel::ANSWER != 0 {
+        let answers = (0..2).map(|at| {
+            (
+                at,
+                Rect {
+                    y: ANSWER_BAR.y + ANSWER_STEP * at,
+                    ..ANSWER_BAR
+                },
+            )
+        });
+        return on(part::ROWS, answers.collect());
+    }
+    match state {
+        state::MAIN => on(part::ROWS, player_panel::line_rects(main_lines)),
+        state::SKINS => {
+            let cursor = screen.cursor;
+            let shown = i32::from(cursor.lines) - i32::from(cursor.first);
+            let rows = player_panel::row_rects(skin_lines, &SKIN_PIECES, SKIN_FIRST_ROW, SKIN_STEP);
+            on(
+                part::ROWS,
+                rows.into_iter()
+                    .filter(|(at, _)| i32::from(*at) < shown)
+                    .collect(),
+            )
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A menu through the shared menu drawer (`0x8002A60C`): the frame of every piece, the
 /// one under the cursor pulsing, and the picture of a piece that has one.
 fn menu(
@@ -757,6 +884,78 @@ mod tests {
     fn go(screen: &mut MergeScreen, buttons: u16) {
         screen.pass(&press(buttons));
         screen.pass(&Pad::default());
+    }
+
+    /// Passes on which the pad presses what [`way`] asks until the cursor is on the
+    /// spot, at most `most`.
+    fn walk(screen: &mut MergeScreen, to: Spot, most: usize) -> Vec<Spot> {
+        let mut seen = Vec::new();
+        for _ in 0..most {
+            if here(screen) == to {
+                break;
+            }
+            let way = way(screen, to);
+            go(screen, way);
+            seen.push(here(screen));
+        }
+        seen
+    }
+
+    #[test]
+    fn a_pointer_finds_the_rows_and_steers_between_the_two_lists() {
+        let mut game = Carried::new_game();
+        game.creatures.put(CARRIED, record(5));
+        game.caught.put(record(6));
+        let mut screen = MergeScreen::open(SECOND_SET, &mut game);
+        let main = lines(&[(15, 77), (15, 100), (15, 123), (15, 146), (15, 169)], 43);
+        let carried = lines(&[(13, 93), (13, 108), (13, 123)], 0);
+        let kept = lines(&[(13, 154), (13, 169), (13, 184), (13, 199)], 0);
+        let all = [&main[..], &carried[..], &kept[..], &[][..]];
+        // The main menu: its five rows.
+        let found = spots(&screen, all);
+        assert_eq!(found.len(), 5);
+        assert_eq!(found[3], ((state::MAIN, part::ROWS, 3), main[3][0].rect));
+        assert_eq!(way(&screen, (state::MAIN, part::ROWS, 3)), pad::DOWN);
+        // "Who goes with him": the rows of the carried and of the kept.
+        let take = (state::TAKE, part::ROWS, 2);
+        walk(&mut screen, (state::MAIN, part::ROWS, 2), 4);
+        go(&mut screen, pad::CROSS);
+        assert_ne!(here(&screen), take);
+        let found = spots(&screen, all);
+        assert_eq!(found.len(), 3 + 4);
+        assert_eq!(
+            found[0],
+            ((state::TAKE, part::CARRIED, 0), carried[0][0].rect)
+        );
+        assert_eq!(found[6], ((state::TAKE, part::KEPT, 3), kept[3][0].rect));
+        // Down from the carried into the kept, and down the kept until it scrolls:
+        // the line of the kept stays the one that was pointed at.
+        let to = (state::TAKE, part::KEPT, 5);
+        let seen = walk(&mut screen, to, 12);
+        assert_eq!(seen.last(), Some(&to));
+        assert_eq!(screen.cursor.first, 2);
+        let found = spots(&screen, all);
+        assert_eq!(found[3].0, (state::TAKE, part::KEPT, 2));
+        // Back up the kept, which scrolls back, and into the carried.
+        let to = (state::TAKE, part::CARRIED, 1);
+        let seen = walk(&mut screen, to, 12);
+        assert_eq!(seen.last(), Some(&to));
+        assert!(seen.contains(&(state::TAKE, part::KEPT, 0)));
+        // A spot of another state leads nowhere.
+        assert_eq!(way(&screen, (state::MAIN, part::ROWS, 0)), 0);
+        // A question: the bars of "Yes" and "No" on the keeper's lines; none while her
+        // second lines wait for a button.
+        screen.state = state::SPIN_ASKED;
+        screen.panels = crate::merge_screen::PANELS[state::SPIN_ASKED as usize];
+        let answers = spots(&screen, all);
+        let no = Rect {
+            y: 53,
+            ..ANSWER_BAR
+        };
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[1], ((state::SPIN_ASKED, part::ROWS, 1), no));
+        screen.flags |= flag::MORE;
+        assert!(spots(&screen, all).is_empty());
     }
 
     #[test]

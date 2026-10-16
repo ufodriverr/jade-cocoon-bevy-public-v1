@@ -340,6 +340,11 @@ impl Record {
         self.status & status::DEAD != 0
     }
 
+    pub fn make_whole(&mut self) {
+        self.status = 0;
+        (self.hp, self.mp) = (self.max_hp, self.max_mp);
+    }
+
     /// Applies the levels that wait in the experience word (`0x80011D98`) and answers
     /// how many they were. `None` when the tables have no steps.
     pub fn grow(&mut self, tables: &Tables, growth: Growth) -> Option<u32> {

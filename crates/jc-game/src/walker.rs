@@ -135,6 +135,10 @@ pub struct Walker {
     /// The command word an order state of a script has made for the next game frame, in
     /// place of the pad's (`shown.rs`, `step_player`).
     pub ordered: Option<u32>,
+    /// The stick the keyboard's steering makes for the next game frame (`shown.rs`,
+    /// [`crate::shown::Steering`]), in the room's own axes: the camera's direction it is
+    /// turned by is 0. None steers with the buttons.
+    pub stick: Option<[i8; 2]>,
     later: Later,
     crosses: Crosses,
     /// Game frames since the first room started, which is the counter of the turn filter
@@ -566,7 +570,13 @@ impl Walker {
         self.fire_events();
         let (place, angle) = (self.player.position, self.player.angle);
         self.way = InTheWay::of(&self.body.arc, place, angle, &self.things);
-        let command = player::button_command(held);
+        let command = match self.stick.take() {
+            Some(stick) => {
+                (self.player.stick, self.player.camera) = (stick, 0);
+                player::stick_command(stick)
+            }
+            None => player::button_command(held),
+        };
         self.player.command = self.way.turned_away(command);
         self.turned_away += u32::from(self.player.command != command);
         // The command word of an order state goes to the controller as it is.
@@ -1071,6 +1081,7 @@ pub fn load(
         roams: None,
         mate: None,
         carried: None,
+        opponent: None,
         table: 0,
     };
     let mut walker = Walker {
@@ -1097,6 +1108,7 @@ pub fn load(
         things: Vec::new(),
         way: InTheWay::default(),
         turned_away: 0,
+        stick: None,
         stands_in: data.view_at(place).unwrap_or(0),
         kept: own_meshes,
         rested,

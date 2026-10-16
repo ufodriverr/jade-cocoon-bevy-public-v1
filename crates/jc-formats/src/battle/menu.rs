@@ -77,6 +77,7 @@ pub mod sets {
 /// The command of a root cell by the side and the cursor, and by the command the level
 /// behind it, its target class and its kind.
 const COMMANDS: [[u8; 6]; 2] = [[0, 1, 2, 3, 4, 5], [0, 1, 6, 7, 8, 5]];
+const DUEL_COMMANDS: [u8; 6] = [0, 1, 6, 7, 8, 4];
 const NEXT: [u8; 9] = [4, 5, 4, 4, 1, 5, 2, 3, 4];
 const CLASS: [u8; 9] = [4, 0, 2, 4, 0, 0, 4, 4, 2];
 const KIND: [u32; 9] = [0, 18, 2, 5, 4, 7, 6, 1, 8];
@@ -122,6 +123,19 @@ pub struct Offer {
     pub spells: u16,
     /// The cursor among the opponents as the last menu left it.
     pub kept: i16,
+    /// The menu of a minion in the build's fight of two players; none in a fight of the
+    /// story.
+    pub duel: Option<DuelOffer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuelOffer {
+    /// The items of the save count: the sixth cell is "Item".
+    pub items: bool,
+    /// The message that closes "Change" (changing is off, or no other minion lives) and
+    /// "Item" (nothing left); none where it is open.
+    pub no_change: Option<u8>,
+    pub no_item: Option<u8>,
 }
 
 /// A row of a list that passed its test: what it makes of the command.
@@ -183,6 +197,7 @@ impl Lists<'_> {
                 crate::player_panel::spells_known(record.spells) as u16
             }),
             kept,
+            duel: None,
         }
     }
 
@@ -449,7 +464,11 @@ impl Asked for Lists<'_> {
         let fighter = self.fight.fighter;
         let row = usize::try_from(row).unwrap_or(0);
         let mut carried = self.carried();
+        // A fight of two players has no player: the rows are the minions alone.
+        let no_player = self.fight.records[PLAYER].is_none();
         let slot = match command {
+            command::ITEM if no_player => carried.nth(row),
+            command::CHANGE if no_player => carried.filter(|slot| *slot != fighter).nth(row),
             // The player's row comes first; a change leaves the acting slot out.
             command::ITEM => row.checked_sub(1).map_or(Some(0), |n| carried.nth(n)),
             command::CHANGE => row
@@ -481,20 +500,10 @@ impl Asked for Lists<'_> {
             // `0x800340C4`: only a spell for the own side is tested, by byte 7 of its
             // record: 0, the target lacks HP; 1, the spell is number 16 or the target
             // has a status of the bits `0x7FB`. Else there is no need for it.
-            command::SPELL => {
-                let Some(spell) = self.tables.spells.get(parameter as usize) else {
-                    return Ok(());
-                };
-                let needed = match spell.need {
-                    0 => record.hp != record.max_hp,
-                    1 => parameter == CURES_ALWAYS || record.status & CURABLE != 0,
-                    _ => true,
-                };
-                match spell.word & FOR_THE_OWN_SIDE == 0 || needed {
-                    true => Ok(()),
-                    false => Err(Some(text::NO_NEED)),
-                }
-            }
+            command::SPELL => match spell_needed(self.tables, parameter as usize, record) {
+                true => Ok(()),
+                false => Err(Some(text::NO_NEED)),
+            },
             _ => Ok(()),
         }
     }
@@ -510,6 +519,22 @@ impl Asked for Lists<'_> {
             _ => false,
         }
     }
+}
+
+/// The test of a spell's target (`0x800340C4`): only a spell for the own side is
+/// tested, by byte 7 of its record: 0, the target lacks HP; 1, the spell is number 16
+/// or the target has a status of the bits `0x7FB`. Else there is no need for it. A
+/// spell the tables do not have passes.
+pub fn spell_needed(tables: &Tables, number: usize, record: &Record) -> bool {
+    let Some(spell) = tables.spells.get(number) else {
+        return true;
+    };
+    let needed = match spell.need {
+        0 => record.hp != record.max_hp,
+        1 => number == CURES_ALWAYS as usize || record.status & CURABLE != 0,
+        _ => true,
+    };
+    spell.word & FOR_THE_OWN_SIDE == 0 || needed
 }
 
 /// The command a finished menu hands over (`0x800C8B40`).
@@ -636,7 +661,11 @@ impl Menu {
             first: 0,
         };
         let standing = offer.opponents.count_ones() as i16;
-        let lines = if offer.fighter == 0 { 6 } else { 5 };
+        let lines = match offer.duel {
+            Some(duel) => 5 + u16::from(duel.items),
+            None if offer.fighter == 0 => 6,
+            None => 5,
+        };
         Self {
             offer,
             level: level::ROOT,
@@ -689,12 +718,26 @@ impl Menu {
     /// The command of the root cell under the cursor (`0x800C7AA0`).
     pub fn command(&self) -> u8 {
         let cell = (self.root.at + self.root.first).clamp(0, 5) as usize;
-        COMMANDS[self.side()][cell]
+        self.commands()[cell]
     }
 
     /// The command of a cell of the root menu.
     pub fn command_of(&self, cell: usize) -> Option<u8> {
-        COMMANDS[self.side()].get(cell).copied()
+        self.commands().get(cell).copied()
+    }
+
+    /// The commands of the root's cells: by the side, or a minion's of the fight of two
+    /// players.
+    fn commands(&self) -> &'static [u8; 6] {
+        match self.offer.duel {
+            Some(_) => &DUEL_COMMANDS,
+            None => &COMMANDS[self.side()],
+        }
+    }
+
+    /// Whether this is the menu of the build's fight of two players.
+    pub fn duel(&self) -> Option<DuelOffer> {
+        self.offer.duel
     }
 
     /// What the last pass drew.
@@ -764,6 +807,13 @@ impl Menu {
 
     /// The root commands that are drawn dim, by their numbers.
     pub fn closed(&self, command: u8) -> Option<u8> {
+        if let Some(duel) = self.offer.duel {
+            return match command {
+                command::CHANGE => duel.no_change,
+                command::ITEM => duel.no_item,
+                _ => None,
+            };
+        }
         if self.side() != 0 {
             return None;
         }
@@ -799,6 +849,15 @@ impl Menu {
     /// The cursor among the opponents, for the next menu's [`Offer::kept`].
     pub fn kept(&self) -> i16 {
         self.opponents.at
+    }
+
+    /// While a target among the opponents is picked one at a time, the slot of the
+    /// opponent at each place of the cursor, in their order; none else. For a pointer
+    /// of the build, which finds the opponents on the fight's picture.
+    pub fn opponent_places(&self) -> Option<Vec<usize>> {
+        let single = self.level == level::TARGET
+            && self.class & (class::EVERYBODY | class::OPPONENTS) == class::OPPONENTS;
+        single.then(|| self.standing().collect())
     }
 
     /// The message of a refused confirm while its state is on.
@@ -1029,7 +1088,12 @@ impl Menu {
             // The rows of the own side: the carried creatures, for an item with the
             // player; a spell has one.
             let carried = self.offer.carried.count_ones() as i16;
+            // Without a player beside the minion: the minions alone, and for a change
+            // those but the one that fights.
+            let duel = self.offer.duel.is_some();
             let rows = match command as u8 {
+                command::ITEM if duel => Some(carried),
+                command::CHANGE if duel => Some((carried - 1).max(0)),
                 command::ITEM => Some(carried + 1),
                 command::SUMMON | command::CHANGE => Some(carried),
                 command::SPELL => Some(1),
@@ -1133,6 +1197,7 @@ mod tests {
             places: 6,
             spells: 2,
             kept: 0,
+            duel: None,
         }
     }
 
@@ -1387,5 +1452,53 @@ mod tests {
         go(&mut menu, pad::DOWN);
         menu.pass(&held, &Lists);
         assert!(!menu.describes());
+    }
+
+    #[test]
+    fn a_minion_of_the_fight_of_two_players_has_five_commands_and_the_items() {
+        let duel = DuelOffer {
+            items: true,
+            no_change: Some(text::NO_CREATURE),
+            no_item: None,
+        };
+        let mut menu = Menu::new(Offer {
+            duel: Some(duel),
+            ..offer(1)
+        });
+        assert_eq!(menu.root().lines, 6);
+        let cells: Vec<u8> = (0..6).filter_map(|cell| menu.command_of(cell)).collect();
+        assert_eq!(
+            cells,
+            [
+                command::ATTACK,
+                command::DEFEND,
+                command::BODY,
+                command::SPELL,
+                command::CHANGE,
+                command::ITEM
+            ]
+        );
+        assert_eq!(menu.closed(command::CHANGE), Some(text::NO_CREATURE));
+        assert_eq!(menu.closed(command::ITEM), None);
+        // Without the items the root has the five alone.
+        let plain = Menu::new(Offer {
+            duel: Some(DuelOffer {
+                items: false,
+                ..duel
+            }),
+            ..offer(1)
+        });
+        assert_eq!(plain.root().lines, 5);
+        // The items' picker has no row of a player: as many rows as minions.
+        go(&mut menu, pad::DOWN);
+        go(&mut menu, pad::DOWN);
+        go(&mut menu, pad::RIGHT);
+        assert_eq!(menu.command(), command::ITEM);
+        go(&mut menu, pad::CROSS);
+        assert_eq!(menu.level(), level::ITEMS);
+        go(&mut menu, pad::DOWN);
+        go(&mut menu, pad::CROSS);
+        assert_eq!(menu.level(), level::TARGET);
+        assert_eq!(menu.own().rows, 2);
     }
 }

@@ -7,7 +7,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Archive, DiscImage, Executable};
 
@@ -21,6 +21,42 @@ pub struct LocalConfig {
     pub disc_image: PathBuf,
     /// Where converted assets are written.
     pub cache_dir: PathBuf,
+    /// How the keyboard steers the player (the table `[controls]`).
+    pub controls: Controls,
+}
+
+/// The table `[controls]` of `jc.local.toml`: choices of the build for a PC, not of the
+/// game. A file without it gets the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Controls {
+    /// How the directions move the player.
+    pub movement: Movement,
+    /// The directions alone run, and Shift makes a walk of it; false is the other way
+    /// round, as the pad's run button is.
+    pub always_run: bool,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            movement: Movement::Modern,
+            always_run: true,
+        }
+    }
+}
+
+/// How the directions move the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Movement {
+    /// The way the screen shows: up goes up the picture, left to its left, and the
+    /// player turns there by itself (the game's own steering of an analog stick).
+    #[default]
+    Modern,
+    /// The pad's buttons as the game reads them: up and down walk forward and back, the
+    /// two sides turn on the spot.
+    Tank,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +65,8 @@ struct RawConfig {
     disc_image: PathBuf,
     #[serde(default = "default_cache_dir")]
     cache_dir: PathBuf,
+    #[serde(default)]
+    controls: Controls,
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -107,6 +145,7 @@ impl LocalConfig {
         Ok(Self {
             disc_image: base.join(raw.disc_image),
             cache_dir: base.join(raw.cache_dir),
+            controls: raw.controls,
         })
     }
 }
@@ -183,6 +222,30 @@ mod tests {
             LocalConfig::parse("disc_image = 'game.bin'\ncache_dir = 'out'\n", base).unwrap();
         assert_eq!(config.disc_image, base.join("game.bin"));
         assert_eq!(config.cache_dir, base.join("out"));
+        assert_eq!(config.controls, Controls::default());
+    }
+
+    #[test]
+    fn reads_the_controls_and_rejects_unknown_ones() {
+        let text = "disc_image = 'a.bin'
+[controls]
+movement = 'tank'
+";
+        let config = LocalConfig::parse(text, Path::new("")).unwrap();
+        assert_eq!(config.controls.movement, Movement::Tank);
+        assert!(config.controls.always_run);
+        let text = "disc_image = 'a.bin'
+[controls]
+always_run = false
+";
+        let config = LocalConfig::parse(text, Path::new("")).unwrap();
+        assert_eq!(config.controls.movement, Movement::Modern);
+        assert!(!config.controls.always_run);
+        let text = "disc_image = 'a.bin'
+[controls]
+movement = 'sideways'
+";
+        assert!(LocalConfig::parse(text, Path::new("")).is_err());
     }
 
     #[test]

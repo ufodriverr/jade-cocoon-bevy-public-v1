@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
 use jc_formats::menu::{self, Frames, Rect, Style};
+use jc_formats::options_panel;
 use jc_formats::options_screen::{self, OptionsScreen};
 use jc_formats::pad::{self, Pad, Repeat};
 use jc_formats::tim::{self, Tim};
@@ -13,16 +14,22 @@ use crate::WINDOW_SIZE;
 use crate::movie_view::{Failure, Playing, ShowMovie};
 use crate::music::Music;
 use crate::options_view::{self, View};
+use crate::pc_settings::{self, PcSettings};
+use crate::pointer::{self, Aim, Pointer};
+use crate::prefs::Prefs;
 use crate::settings::Settings;
 use crate::text_view;
 
 /// `--title`: the title screen without the opening movie before it.
 /// `--press-start=SECONDS` holds the Start button from that second of the title on, and
 /// `--press=SECONDS:BUTTON,...` taps a button at a second of the title.
+/// `--pc-settings[=PAGE]` opens the options at once, and the PC Settings on that page
+/// over them (`pc_settings.rs`).
 #[derive(Resource)]
 pub struct ShowTitle {
     pub press_start: Option<f64>,
     pub presses: Vec<Press>,
+    pub pc_settings: Option<crate::pc_settings::Page>,
 }
 
 /// `--title-again=SECONDS:BUTTON,...`: the buttons a hidden run taps on a title that
@@ -32,7 +39,7 @@ pub struct ShowTitle {
 pub struct BehindAMovie(pub Vec<Press>);
 
 /// A button that a hidden run holds for a moment.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Press {
     from: f64,
     pub button: u16,
@@ -97,6 +104,8 @@ struct Options {
     view: View,
     shown: Entity,
     stale: bool,
+    /// The spot the mouse steers the screen's cursor to.
+    aim: Aim<options_panel::Spot>,
 }
 
 /// The title screen while it is up.
@@ -121,6 +130,20 @@ pub struct Title {
     /// The screen of a memory card warning, once the check has asked for one.
     warning: Option<Entity>,
     options: Option<Options>,
+    /// The menu's line the mouse steers the cursor to (`pointer.rs`), and a click on
+    /// the words of the "press Start" screen that waits for a pass.
+    aim: Aim<i16>,
+    start_click: bool,
+    /// `--pc-settings`: the page of the PC Settings to open over the options.
+    pc_asked: Option<pc_settings::Page>,
+}
+
+impl Title {
+    /// The title's own pictures alone are on screen, which the setting `zoom` may cut
+    /// at the top and the bottom (`display.rs`); not the options, not a warning.
+    pub fn zooms(&self) -> bool {
+        self.options.is_none() && self.warning.is_none()
+    }
 }
 
 /// The images of the title's texture set and the frame drawer's tables.
@@ -137,7 +160,7 @@ fn load() -> Result<(Vec<Tim>, Frames), Failure> {
 }
 
 /// A picture of the console's screen where the window shows it: the screen fills the
-/// window.
+/// units of the old window, which `display.rs` lays into the window.
 fn on_screen(
     image: Handle<Image>,
     corner: (i16, i16),
@@ -231,6 +254,18 @@ fn open(
     images: &mut Assets<Image>,
     commands: &mut Commands,
 ) -> Result<Title, Failure> {
+    open_with(press_start, presses, None, images, commands)
+}
+
+/// The same, with `--pc-settings`: the menu with the cursor on "Options", which waits
+/// for the options screen.
+fn open_with(
+    press_start: Option<f64>,
+    presses: Vec<Press>,
+    pc_asked: Option<pc_settings::Page>,
+    images: &mut Assets<Image>,
+    commands: &mut Commands,
+) -> Result<Title, Failure> {
     let (set, frames) = load()?;
     let (wide, high) = (title::SCREEN.0 as usize, title::SCREEN.1 as usize);
     let mut backdrop = vec![0; wide * high * 4];
@@ -275,8 +310,13 @@ fn open(
         set.len(),
         title::PICTURES
     );
+    let mut state = title::Title::new();
+    if pc_asked.is_some() {
+        state.screen = Screen::OptionsWait;
+        state.cursor.at = 3;
+    }
     Ok(Title {
-        state: title::Title::new(),
+        state,
         pad: None,
         passes: 0,
         owed: 0.0,
@@ -291,6 +331,9 @@ fn open(
         lines,
         warning: None,
         options: None,
+        aim: Aim::default(),
+        start_click: false,
+        pc_asked,
     })
 }
 
@@ -313,19 +356,21 @@ fn warn(
 fn open_options(
     settings: &options_screen::Settings,
     time: u32,
+    pc: (&PcSettings, &Prefs),
     images: &mut Assets<Image>,
     commands: &mut Commands,
 ) -> Result<Options, Failure> {
     let view = View::read()?;
     let screen = OptionsScreen::open(settings);
     let size = (title::SCREEN.0 as u32, title::SCREEN.1 as u32);
-    let rgba = view.screen(&screen, settings, time);
+    let rgba = view.screen(&screen, settings, time, pc);
     let handle = images.add(picture(size.0, size.1, rgba));
     Ok(Options {
         screen,
         view,
         shown: commands.spawn(on_screen(handle, (0, 0), size, 3.0)).id(),
         stale: false,
+        aim: Aim::default(),
     })
 }
 
@@ -434,6 +479,19 @@ fn start_music(music: &mut Music) {
     }
 }
 
+pub fn again(
+    presses: Vec<Press>,
+    music: &mut Music,
+    images: &mut Assets<Image>,
+    commands: &mut Commands,
+) -> Result<(), Failure> {
+    let title = open(None, presses, images, commands)?;
+    start_music(music);
+    commands.insert_resource(title);
+    info!("the title screen: opens again, on the press Start screen");
+    Ok(())
+}
+
 /// `--title`: the screen alone.
 pub fn show_title(
     show: Res<ShowTitle>,
@@ -443,9 +501,10 @@ pub fn show_title(
     mut exit: MessageWriter<AppExit>,
 ) {
     commands.spawn(Camera2d);
-    match open(
+    match open_with(
         show.press_start,
         show.presses.clone(),
+        show.pc_settings,
         &mut images,
         &mut commands,
     ) {
@@ -470,7 +529,8 @@ pub static SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 const REFRESHES: f64 = 50.0;
 
 /// The pad's word of held buttons from the keyboard, or from the presses of a hidden run.
-fn buttons(current: &Title, keys: &ButtonInput<KeyCode>) -> u16 {
+/// L1 and R1 turn the pages of the PC Settings, and are nothing on the title else.
+fn buttons(current: &Title, keys: &crate::keys::Pad, pc: bool) -> u16 {
     // A hidden run that presses Start at a set time takes it from nowhere else.
     let mut held = match current.press_start {
         Some(from) if current.time >= from => pad::START,
@@ -478,7 +538,10 @@ fn buttons(current: &Title, keys: &ButtonInput<KeyCode>) -> u16 {
         None => crate::keys::held(keys) & pad::START,
     };
     // Left and right are the options screen's.
-    let own = pad::CROSS | pad::TRIANGLE | pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT;
+    let mut own = pad::CROSS | pad::TRIANGLE | pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT;
+    if pc {
+        own |= pad::L1 | pad::R1;
+    }
     held |= crate::keys::held(keys) & own;
     for press in &current.presses {
         if press.holds(current.time) {
@@ -490,23 +553,45 @@ fn buttons(current: &Title, keys: &ButtonInput<KeyCode>) -> u16 {
 
 /// One pass of the options screen's task while the title waits for it, on the settings
 /// of the app. The pass in which it ends tells the title, whose next pass finds it gone.
-fn run_options(current: &mut Title, settings: &mut ResMut<Settings>, pad: &Pad, music: &mut Music) {
+/// The PC Settings asked for by `--pc-settings` open behind the options' first pass.
+fn run_options(
+    current: &mut Title,
+    settings: &mut ResMut<Settings>,
+    pad: &Pad,
+    (music, pc, prefs): (&mut Music, &mut PcSettings, &mut ResMut<Prefs>),
+) {
     let Some(options) = current.options.as_mut() else {
         return;
     };
     // Only a pass that changes a setting marks the resource as changed.
     let mut set = settings.0;
+    let mut preferred = (pc.is_open()).then(|| (**prefs).clone());
     let who = "the title screen";
     let pass = options_view::pass(
         who,
         current.passes,
-        &mut options.screen,
+        (&mut options.screen, &mut options.aim),
         &mut set,
         pad,
-        music,
+        (
+            music,
+            pc,
+            preferred.as_mut().unwrap_or(&mut Prefs::default()),
+        ),
     );
     if set != settings.0 {
         settings.0 = set;
+    }
+    if let Some(preferred) = preferred.filter(|preferred| *preferred != **prefs) {
+        **prefs = preferred;
+    }
+    if options.screen.page == options_screen::FIRST
+        && options.screen.cursor.columns == 1
+        && let Some(page) = current.pc_asked.take()
+    {
+        options.screen.cursor.at = options_view::PC_LINE;
+        options.screen.kept = options_view::PC_LINE;
+        pc.open(page);
     }
     options.stale = true;
     if pass.ended {
@@ -529,8 +614,8 @@ pub fn run_title(
     mut music: ResMut<Music>,
     mut settings: ResMut<Settings>,
     mut clock: ResMut<crate::saving::PlayClock>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     mut looks: Query<&mut Visibility>,
@@ -544,6 +629,8 @@ pub fn run_title(
         Res<BehindAMovie>,
         Local<bool>,
     ),
+    pointer: Pointer,
+    (mut pc, mut prefs): (ResMut<PcSettings>, ResMut<Prefs>),
 ) {
     let Some(mut current) = current else {
         if playing.is_some_and(|playing| playing.leads_to_the_title()) {
@@ -561,10 +648,37 @@ pub fn run_title(
         }
         return;
     };
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(title::PASSES_A_SECOND);
-    let held = buttons(&current, &keys);
+    let held = buttons(&current, &keys, pc.is_open());
+    // The mouse over the menu's lines, or over the words of the "press Start" screen,
+    // where its left button is Start.
+    let window = Vec2::new(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32);
+    let under = pointer.on_stretched(window);
+    let on_words = under.is_some_and(|at| pointer::inside(title::PRESS_START_FRAME, at));
+    match current.state.screen == Screen::PressStart {
+        true => current.start_click |= on_words && pointer.mouse().clicked(),
+        false => current.start_click = false,
+    }
+    if current.state.screen == Screen::Menu {
+        let lines = (title::LINES.iter().zip(0..)).map(|(line, at)| (at, line.frame));
+        current
+            .aim
+            .look(pointer.mouse(), pointer::row_under(lines, under));
+    } else {
+        current.aim.forget();
+    }
+    if let Some(options) = current.options.as_mut() {
+        let lines = options.view.lines();
+        options_view::look(
+            (&mut options.aim, &mut pc),
+            pointer.mouse(),
+            under,
+            &options.screen,
+            lines,
+        );
+    }
     // The memory card's screen of "Continue" was up and is gone: the title's next pass
     // finds its word cleared, and a game it loaded waits for the field.
     if current.state.screen == Screen::Card {
@@ -589,7 +703,18 @@ pub fn run_title(
         current.passes += 1;
         let passes = current.passes;
         let mut pad = current.pad.unwrap_or_default();
-        pad.read(held, Repeat::of(1), passes);
+        // A click on the words is Start for one pass, however short it was.
+        let start = match current.state.screen == Screen::PressStart {
+            true if std::mem::take(&mut current.start_click) => pad::START,
+            _ => 0,
+        };
+        pad.read(held | start, Repeat::of(1), passes);
+        if current.state.screen == Screen::Menu {
+            let at = current.state.cursor.at;
+            let cursor = current.state.cursor;
+            let way = |line| cursor.way_to(line);
+            current.aim.steer(&mut pad, at, way);
+        }
         current.pad = Some(pad);
         let line = current.state.cursor.at;
         for sound in current.state.sounds(&pad) {
@@ -598,7 +723,12 @@ pub fn run_title(
         let waits = current.state.screen == Screen::Options;
         let step = current.state.pass(&pad);
         if waits && step == Step::Stays {
-            run_options(&mut current, &mut settings, &pad, &mut music);
+            run_options(
+                &mut current,
+                &mut settings,
+                &pad,
+                (&mut music, &mut pc, &mut prefs),
+            );
         }
         let seconds = current.time;
         if current.state.cursor.at != line {
@@ -646,7 +776,8 @@ pub fn run_title(
             }
             Step::OptionsStart => {
                 let time = menu::frame_time(passes, 1);
-                match open_options(&settings.0, time, &mut images, &mut commands) {
+                let pc = (&*pc, &*prefs);
+                match open_options(&settings.0, time, pc, &mut images, &mut commands) {
                     Ok(options) => current.options = Some(options),
                     Err(err) => {
                         error!("the options screen: {err}");
@@ -701,6 +832,15 @@ pub fn run_title(
                     }
                 }
                 continue;
+            }
+            Step::Chosen(Choice::ArenaBattleStage) => {
+                info!(
+                    "the title screen: Arena Battle Stage after {passes} passes, the lobby of the fight of two players opens"
+                );
+                music.give_back();
+                close(&mut current, &mut commands);
+                commands.insert_resource(crate::lobby::Wanted);
+                return;
             }
             Step::Chosen(choice) => {
                 info!(
@@ -778,7 +918,8 @@ pub fn run_title(
         options.stale = false;
         if let Ok(mut sprite) = sprites.get_mut(options.shown) {
             let size = (title::SCREEN.0 as u32, title::SCREEN.1 as u32);
-            let rgba = options.view.screen(&options.screen, &settings.0, time);
+            let pc = (&*pc, &*prefs);
+            let rgba = options.view.screen(&options.screen, &settings.0, time, pc);
             sprite.image = images.add(picture(size.0, size.1, rgba));
         }
     }

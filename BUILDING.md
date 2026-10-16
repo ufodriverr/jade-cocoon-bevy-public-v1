@@ -2,7 +2,7 @@
 
 The supported build is Windows x64 (`x86_64-pc-windows-msvc`). Install Rust stable
 and the Visual Studio Desktop development with C++ workload with the Windows SDK.
-The prepared v1.0.0 build uses rustc/cargo 1.99.0. `Cargo.lock` pins dependency versions.
+The prepared v1.1.0 build uses rustc/cargo 1.99.0. `Cargo.lock` pins dependency versions.
 `build-release.ps1` applies the release build's source-path remapping so a local user
 profile does not appear in compiled source-location strings. Run it from PowerShell:
 
@@ -27,6 +27,9 @@ ZIP, matching complete source archive, and SHA256SUMS.txt together. The source a
 includes vendored Cargo dependency source, Cargo.lock and the offline Cargo config.
 After extracting the complete source archive, add `--offline` to the commands above
 to build without downloading Cargo dependencies, or run `./build-release.ps1 -Offline`.
+The archive's `SOURCE-REVISION.txt` names the release commit. The build reads it, so an
+executable built from the complete source archive can play Arena Battle with the
+released one (two builds must name the same version and commit to play together).
 Rust, the C++ toolchain, Windows SDK
 and ordinary system libraries are separate prerequisites.
 

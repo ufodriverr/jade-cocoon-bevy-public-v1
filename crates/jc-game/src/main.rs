@@ -1,3 +1,7 @@
+// A release exe for players opens no console window: its log goes to `logs\` of the game
+// folder (`logging.rs`). A debug build keeps the console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -25,35 +29,63 @@ use jc_formats::tim;
 use jc_formats::vram::Vram;
 
 mod actors;
+mod assist;
+mod audio;
 mod before;
+mod bindings;
 mod card_view;
 mod chapter;
 mod disc_prompt;
+mod display;
+mod duel_check;
 mod end_view;
 mod field;
 mod fight_effects;
 mod fight_menu_view;
+mod gamepad;
+mod guards;
+mod hint;
 mod keys;
+mod lobby;
+mod local_time;
+mod logging;
 mod merge_view;
 mod model_view;
 mod movie_sound;
 mod movie_view;
 mod music;
 mod name_entry;
+mod net;
+mod notice;
 mod options_view;
+mod pace;
+mod paths;
+mod pc_settings;
 mod place_map;
 mod player_menu;
+mod pointer;
+mod prefs;
+mod prompts;
+mod quick;
 mod results_view;
 mod saving;
 mod scripts;
 mod settings;
 mod shop_view;
 mod shown;
+mod skip;
+mod smooth;
 mod text_view;
 mod title;
+mod versus_check;
+mod versus_view;
 mod voices;
 mod walker;
+mod widescreen;
 
+/// The window of a check run, and the units every screen of the console's shape but a
+/// room is drawn in, three to a pixel of the console (`display.rs` lays them into the
+/// window).
 const WINDOW_SIZE: (u32, u32) = (960, 720);
 /// Frames to run before a smoke exit or a screenshot when no count is given.
 const DEFAULT_FRAMES: u32 = 120;
@@ -65,6 +97,9 @@ const CAPTURE_TIMEOUT_FRAMES: u32 = 600;
 ///
 /// `--screenshot=PATH` does the same and saves a PNG of the window before exiting, so a run
 /// can look at what the app shows. The frame count still comes from `--smoke=FRAMES`.
+/// `--screenshot-frames=N` saves N frames one after the other in place of one, as
+/// `PATH` with `_00`, `_01` and so on before its extension (to look at the glide of
+/// `smooth.rs` between two game frames).
 ///
 /// Both keep the window hidden; `--show` puts it on screen as in a normal run.
 #[derive(Resource)]
@@ -78,6 +113,22 @@ struct Capture {
     /// When the screenshot was requested; `None` until the frame count has run out.
     requested: Option<SystemTime>,
     frames_waited: u32,
+    /// The frames to save one after the other, and those asked for so far.
+    frames: u32,
+    taken: u32,
+}
+
+impl Capture {
+    /// The file of the `nth` frame: the path itself for a single one.
+    fn path_of(&self, nth: u32) -> PathBuf {
+        if self.frames <= 1 {
+            return self.path.clone();
+        }
+        let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = self.path.extension().unwrap_or_default().to_string_lossy();
+        self.path
+            .with_file_name(format!("{stem}_{nth:02}.{extension}"))
+    }
 }
 
 /// `--texture=FILE[:N]` is a debug view: it shows texture `N` (0 when left out) of file
@@ -328,6 +379,57 @@ fn parse_scroll(value: &str) -> Option<IVec2> {
 fn main() -> AppExit {
     std::sync::LazyLock::force(&title::STARTED);
     let args: Vec<String> = std::env::args().collect();
+    // `--duel-check=SEED`: a whole fight of two players without a screen, logged, and
+    // the run ends (`duel_check.rs`). No window and no App.
+    if let Some(seed) = duel_check::asked(&args) {
+        let run = seed
+            .map_err(Into::into)
+            .and_then(|seed| duel_check::run(seed, &args));
+        return match run {
+            Ok(()) => AppExit::Success,
+            Err(err) => {
+                eprintln!("duel check: {err}");
+                AppExit::error()
+            }
+        };
+    }
+    // `--write-versus-saves=DIR`: the saves of two teams for a check of the lobby of the
+    // fight of two players (`duel_check.rs`), and the run ends.
+    if let Some(folder) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--write-versus-saves="))
+    {
+        return match duel_check::write_saves(std::path::Path::new(folder)) {
+            Ok(written) => {
+                for path in written {
+                    println!("versus: a save of a team in {}", path.display());
+                }
+                AppExit::Success
+            }
+            Err(err) => {
+                eprintln!("versus saves: {err}");
+                AppExit::error()
+            }
+        };
+    }
+    // `--versus=host[:PORT]` / `--versus=join:ADDR`: one side of a fight of two players
+    // over the network, played by a bot on 127.0.0.1, logged, and the run ends
+    // (`versus_check.rs`). No window and no App.
+    // With a window (`--versus-view`, or `--smoke`/`--screenshot=` for a hidden check) the
+    // same option is the fight on screen (`versus_view.rs`).
+    let versus_view = versus_view::shown(&args);
+    if let Some(mode) = versus_check::asked(&args).filter(|_| !versus_view) {
+        let run = mode
+            .map_err(Into::into)
+            .and_then(|mode| versus_check::run(mode, &args));
+        return match run {
+            Ok(()) => AppExit::Success,
+            Err(err) => {
+                println!("versus: {err}");
+                AppExit::error()
+            }
+        };
+    }
     let frames = args.iter().find_map(|arg| {
         let rest = arg.strip_prefix("--smoke")?;
         Some(rest.strip_prefix('=').and_then(|n| n.parse().ok()))
@@ -508,6 +610,29 @@ fn main() -> AppExit {
     // that it does not come up over whatever else is on the screen. `--show` brings it back.
     let hidden =
         (frames.is_some() || screenshot.is_some()) && !args.iter().any(|arg| arg == "--show");
+    // A play session keeps the player's settings, the log and the game feel beside the
+    // saves in the game folder (`prefs.rs`, `logging.rs`); a run that ends on its own or
+    // taps buttons by itself is a check and keeps none of them.
+    let automated = frames.is_some()
+        || screenshot.is_some()
+        || args.iter().any(|arg| {
+            arg.contains("press=")
+                || arg == "--confirms"
+                || arg == "--skip-scenes"
+                || arg == "--save-check"
+                || [
+                    "--pad",
+                    "--cross",
+                    "--steer=",
+                    "--stick=",
+                    "--menu-at=",
+                    "--hold=",
+                ]
+                .iter()
+                .any(|option| arg.starts_with(option))
+        });
+    let live = !automated;
+    let log = live.then(logging::start);
 
     // A play session asks for the disc image when none is stored or the stored one is
     // gone, and stores the answer. A run that ends on its own never asks: without an
@@ -517,20 +642,40 @@ fn main() -> AppExit {
         && let Err(err) = disc_prompt::ensure()
     {
         eprintln!("jc-game cannot start: {err}");
+        disc_prompt::cannot_start(&err);
         return AppExit::error();
     }
 
     let mut app = App::new();
+    // The settings are there before the plugins, which read them (`keys.rs`).
+    let (mut prefs, prefs_file) = prefs::at_start(live);
+    // A check keeps its window of 960 by 720 (`--resolution=` and the like change it).
+    if !live {
+        display::for_a_check(&mut prefs.display, &args);
+        pace::for_a_check(&mut prefs.feel.pace, &args);
+        assist::for_a_check(&mut prefs.feel.assist, &args);
+        prompts::for_a_check(&mut prefs.feel.prompts, &args);
+    }
+    // The first room may be read before the first frame.
+    assist::set(&prefs.feel.assist);
+    let exact = live || args.iter().any(|arg| arg.starts_with("--resolution="));
+    let window = display::window(&prefs.display, hidden, exact);
+    app.insert_resource(prefs.clone())
+        .insert_resource(prefs_file)
+        .insert_resource(guards::Unsaved::default())
+        .init_resource::<guards::Asking>();
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Jade Cocoon".into(),
-                    resolution: WINDOW_SIZE.into(),
-                    visible: !hidden,
-                    focused: !hidden,
-                    ..default()
-                }),
+                primary_window: Some(window),
+                // The close button asks first in a game that has gone on since its
+                // last save (`guards.rs`).
+                close_when_requested: false,
+                ..default()
+            })
+            // A play session's log goes to its file too.
+            .set(bevy::log::LogPlugin {
+                custom_layer: logging::file_layer,
                 ..default()
             })
             // The console does not filter textures.
@@ -541,13 +686,61 @@ fn main() -> AppExit {
         before::BeforePlugin,
         model_view::ModelViewPlugin,
         shown::ShownPlugin,
+        // A check reads no gamepad.
+        gamepad::GamepadPlugin { reads: live },
+        keys::KeysPlugin,
+        pointer::PointerPlugin,
+        name_entry::TypingPlugin,
+        // The window of a check stays as it is made.
+        display::DisplayPlugin {
+            manages_the_window: !hidden,
+        },
+        widescreen::WidescreenPlugin,
+        // F1 and F2 only where there are keys.
+        pace::PacePlugin { keys: !hidden },
+        // The volumes of a PC and the window in the background.
+        audio::AudioPlugin,
+        notice::NoticePlugin,
+        // The keys or the pad's buttons in the lines of help.
+        prompts::PromptsPlugin,
+        // The confirm button over the hero where a press would do something.
+        hint::HintPlugin,
     ))
+    // The PC Settings of the options screen; `--pc-key=NAME` is a check's key.
+    .add_plugins(pc_settings::PcSettingsPlugin {
+        key_of_a_check: (args.iter())
+            .find_map(|arg| arg.strip_prefix("--pc-key="))
+            .map(|name| bindings::key_named(name).expect("--pc-key=NAME takes a key")),
+    })
+    // Start held skips a scene; a play session keeps what was seen (`skip.rs`).
+    .add_plugins(skip::SkipPlugin { live })
     .insert_resource(ClearColor(Color::BLACK));
-    // A play session can be started over from the opening movie with F5. A check has no
-    // keys and ends on its own.
-    if !hidden {
-        app.add_systems(Update, (restart_on_key, speed_on_key));
+    match &log {
+        Some(Ok(path)) => info!("the log of this start: {}", path.display()),
+        Some(Err(err)) => warn!("no log file: {err}"),
+        None => {}
     }
+    // A play session can be started over from the opening movie with Ctrl+F5. A check
+    // has no keys and ends on its own.
+    if !hidden {
+        app.insert_resource(guards::Restarts);
+    }
+    // The settings reach their file whenever they change; the close button asks in a
+    // game that has gone on since its last save (`guards.rs`).
+    app.add_systems(Last, prefs::keep)
+        // A fight of two players tells the other side when the game closes (`net.rs`).
+        .add_systems(Last, net::close_on_exit)
+        // The assists reach the room's loading and its scripts (`assist.rs`).
+        .add_systems(First, assist::reach)
+        .add_systems(Update, guards::ask_before_closing)
+        .add_systems(
+            Update,
+            guards::note_play
+                .run_if(resource_exists::<ShowRoom>)
+                // The arena keeps no game to lose.
+                .run_if(not(resource_exists::<versus_view::Arena>))
+                .run_if(not(resource_exists::<card_view::CardView>)),
+        );
 
     // `--skip-movies=SECONDS` holds Start from that second of every movie that follows
     // the first one, for a hidden run of the chain, and of every movie a script plays;
@@ -561,6 +754,40 @@ fn main() -> AppExit {
 
     // A room brings the camera of the console's screen and a model a camera in space;
     // everything else is shown as it is.
+    // The fight of two players on screen from the command line: the arena's room comes
+    // once both teams are in (`versus_view.rs`), and the title follows its end.
+    let versus_mode = match versus_check::asked(&args).filter(|_| versus_view) {
+        Some(Ok(mode)) => Some(mode),
+        Some(Err(err)) => {
+            println!("versus: {err}");
+            return AppExit::error();
+        }
+        None => None,
+    };
+    // The lobby of the fight of two players behind the title's "Arena Battle Stage"
+    // (`lobby.rs`) and the arena it opens (`versus_view.rs`), whatever started the run:
+    // both do nothing until they are asked for. `--lobby-press=STEP=SECONDS:BUTTON,...;...`
+    // taps buttons on the lobby's steps in a hidden run.
+    let lobby_presses = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--lobby-press="))
+        .map(|value| {
+            lobby::LobbyPresses::of(value).expect(
+                "--lobby-press=STEP=SECONDS:BUTTON,...;... takes the lobby's steps and the buttons of --press",
+            )
+        })
+        .unwrap_or_default();
+    app.insert_resource(lobby_presses).add_systems(
+        Update,
+        (
+            lobby::run_lobby,
+            versus_view::run_arena,
+            versus_view::paint_arena,
+            versus_view::leave_arena,
+        )
+            .chain()
+            .before(shown::draw_things),
+    );
     if let Some(texture) = texture {
         app.insert_resource(texture)
             .add_systems(Startup, show_texture);
@@ -582,7 +809,7 @@ fn main() -> AppExit {
         app.insert_resource(card_view::ShowCard {
             of_title: kind == "=continue",
             presses: presses(),
-            folder: folder.unwrap_or("saves").into(),
+            folder: folder.map_or_else(paths::saves, PathBuf::from),
             told: card_view::Told::of(&args),
             shape: card_view::shape_of(&args),
         })
@@ -879,7 +1106,18 @@ fn main() -> AppExit {
                 .add_systems(FixedUpdate, text_view::run_talk);
         }
     } else {
-        let only_title = movie.is_none() && args.iter().any(|arg| arg == "--title");
+        let pc_settings = args.iter().find_map(|arg| {
+            let rest = arg.strip_prefix("--pc-settings")?;
+            match rest.strip_prefix('=') {
+                Some(page) => Some(
+                    pc_settings::Page::parse(page)
+                        .expect("--pc-settings=PAGE takes display, sound, gameplay or controls"),
+                ),
+                None => rest.is_empty().then(pc_settings::Page::default),
+            }
+        });
+        let only_title =
+            movie.is_none() && (args.iter().any(|arg| arg == "--title") || pc_settings.is_some());
         let movie = movie.unwrap_or_else(movie_view::ShowMovie::opening);
         let movie = match press_start {
             Some(seconds) if !only_title => movie.press_start(seconds),
@@ -904,6 +1142,15 @@ fn main() -> AppExit {
             })
             .unwrap_or_default();
         plays_movies = true;
+        if let Some(mode) = versus_mode.clone() {
+            app.insert_resource(versus_view::Start {
+                mode,
+                args: args.clone(),
+                hidden: !live,
+                lobby: None,
+            })
+            .add_systems(Startup, versus_view::start_arena);
+        }
         app.insert_resource(movie.muted(hidden).skip_later(skip_movies))
             .insert_resource(title::BehindAMovie(again))
             .insert_resource(name_entry::ShowNameEntry {
@@ -919,10 +1166,13 @@ fn main() -> AppExit {
                 )
                     .chain(),
             );
-        if only_title {
+        if versus_mode.is_some() {
+            // The arena of the command line comes first; the title only behind it.
+        } else if only_title {
             app.insert_resource(title::ShowTitle {
                 press_start,
                 presses: presses(),
+                pc_settings,
             })
             .add_systems(Startup, title::show_title);
         } else {
@@ -960,7 +1210,10 @@ fn main() -> AppExit {
         .add_systems(Update, music::play_music);
     app.insert_resource(voices::Voices::new(hidden))
         .add_systems(Update, voices::play_voices);
-    let mut session = settings::Settings::default();
+    let mut session = match live {
+        true => settings::Settings(prefs.game.settings()),
+        false => settings::Settings::default(),
+    };
     if let Some(value) = args.iter().find_map(|arg| arg.strip_prefix("--setting=")) {
         session.0.word = u32::from_str_radix(value.trim_start_matches("0x"), 16)
             .expect("--setting=WORD takes the setting word in hexadecimal");
@@ -1027,12 +1280,34 @@ fn main() -> AppExit {
         title::presses(value).expect("--card-press=SECONDS:BUTTON,... takes the buttons of --press")
     });
     app.insert_resource(card_view::CardsKept {
-        folder: option("--card-dir=").unwrap_or("saves").into(),
+        folder: option("--card-dir=").map_or_else(paths::saves, PathBuf::from),
         presses: card_presses,
         told: card_view::Told::of(&args),
         shape: card_view::shape_of(&args),
     })
     .add_systems(Update, card_view::run_card);
+    // F6 saves into the quick save and F9 loads it; the autosave writes one of three on
+    // the way into a forest, when a chapter starts and in front of a fight of the story
+    // (`quick.rs`). A check presses them
+    // with `--quick-press=SECONDS:save|load,...` and keeps saves only in the folder of
+    // `--card-dir=DIR`.
+    let quick_presses = option("--quick-press=").map_or_else(Vec::new, |value| {
+        quick::presses(value)
+            .expect("--quick-press=SECONDS:save|load|auto,... takes save, load or auto")
+    });
+    app.insert_resource(quick::QuickSaves {
+        folder: option("--card-dir=").map_or_else(paths::saves, PathBuf::from),
+        writes: live || option("--card-dir=").is_some(),
+        presses: quick_presses,
+    })
+    .init_resource::<quick::Autosave>()
+    .add_systems(
+        Update,
+        (quick::note_autosave, quick::run_saves)
+            .chain()
+            .after(card_view::run_card)
+            .before(play_loaded),
+    );
     app.add_systems(
         Update,
         play_loaded
@@ -1053,7 +1328,10 @@ fn main() -> AppExit {
             .expect("--merge-press=SECONDS:BUTTON,... takes the buttons of --press")
     });
     app.insert_resource(merge_view::MergePresses(merge_presses))
-        .add_systems(Update, merge_view::run_merge);
+        .add_systems(
+            Update,
+            (merge_view::point_merge, merge_view::run_merge).chain(),
+        );
     let results_presses = option("--results-press=").map_or_else(Vec::new, |value| {
         title::presses(value)
             .expect("--results-press=SECONDS:BUTTON,... takes the buttons of --press")
@@ -1092,6 +1370,16 @@ fn main() -> AppExit {
         );
     }
 
+    // `--glide-at=F` draws a check between two game frames at one share of the way, and
+    // `--frame-times` logs how long the frames take (`smooth.rs`).
+    if let Some(at) = smooth::glide_at(&args).filter(|_| !live) {
+        app.insert_resource(at);
+    }
+    if args.iter().any(|arg| arg == "--frame-times") {
+        app.init_resource::<smooth::FrameTimes>()
+            .add_systems(First, smooth::start_frame)
+            .add_systems(Last, smooth::log_frame_times);
+    }
     if frames.is_some() || screenshot.is_some() {
         app.insert_resource(Smoke {
             frames_left: frames.flatten().unwrap_or(DEFAULT_FRAMES),
@@ -1099,6 +1387,14 @@ fn main() -> AppExit {
                 path,
                 requested: None,
                 frames_waited: 0,
+                frames: (args.iter())
+                    .find_map(|arg| arg.strip_prefix("--screenshot-frames="))
+                    .map_or(1, |value| {
+                        let frames: u32 =
+                            value.parse().expect("--screenshot-frames=N takes a number");
+                        frames.clamp(1, 99)
+                    }),
+                taken: 0,
             }),
         })
         .add_systems(Update, smoke_exit);
@@ -1257,7 +1553,7 @@ fn show_room(
 fn start_room(
     arrival: Res<chapter::Arrival>,
     game: Res<Game>,
-    cameras: Query<Entity, With<Camera2d>>,
+    cameras: Query<Entity, (With<Camera2d>, Without<display::Presents>)>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<field::AddedMaterial>>,
@@ -1294,12 +1590,19 @@ fn script_music(
     things: Option<ResMut<shown::Things>>,
     mut music: ResMut<music::Music>,
     mut voices: ResMut<voices::Voices>,
+    skip: Option<Res<skip::Skip>>,
 ) {
     let Some(mut things) = things else {
         return;
     };
+    // A scene that the build skips (`skip.rs`) is silent but for its music: no line is
+    // asked for, which the windows take as a line that is over, and no short sound
+    // plays. What a sound that stays does is kept, so that it is right behind the skip.
+    let skipping = skip.is_some_and(|skip| skip.skipping());
     for asked in things.take_music() {
         match asked {
+            scripts::Heard::Line(_) | scripts::Heard::Sound(_) | scripts::Heard::Got(_)
+                if skipping => {}
             scripts::Heard::Line(line) => voices.ask(line),
             scripts::Heard::LineEnds => {
                 voices.end();
@@ -1325,7 +1628,11 @@ fn script_music(
 }
 
 /// Whatever is drawn or draws: the cameras, the sprites and the meshes.
-type Drawn = Or<(With<Camera>, With<Sprite>, With<Mesh2d>, With<Mesh3d>)>;
+/// What lays the picture into the window stays (`display.rs`).
+type Drawn = (
+    Or<(With<Camera>, With<Sprite>, With<Mesh2d>, With<Mesh3d>)>,
+    Without<display::Presents>,
+);
 
 fn open_map(
     show: Res<ShowRoom>,
@@ -1658,8 +1965,13 @@ fn play_loaded(
     mut music: ResMut<music::Music>,
     mut exit: MessageWriter<AppExit>,
     (movie, show): (Option<Res<movie_view::ShowMovie>>, Option<Res<ShowRoom>>),
+    (mut prefs, mut unsaved): (ResMut<prefs::Prefs>, ResMut<guards::Unsaved>),
 ) {
     commands.remove_resource::<saving::Loaded>();
+    // The game feel kept beside the save comes back with it, as the settings in it do
+    // below (`prefs.rs`).
+    prefs::take_feel(&mut prefs, loaded.feel.clone());
+    unsaved.kept(loaded.room, loaded.beside.clock);
     if loaded.beside.finished {
         if let Some(movie) = &movie {
             info!(
@@ -1758,8 +2070,11 @@ fn end_game(
     mut music: ResMut<music::Music>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
+    mut unsaved: ResMut<guards::Unsaved>,
 ) {
     commands.remove_resource::<saving::Ended>();
+    // The player left the game himself: closing the window behind it does not ask.
+    unsaved.left();
     let Some(movie) = movie else {
         warn!(
             "\"End Game\": this run started in a room and has no opening movie and no title \
@@ -1806,6 +2121,19 @@ fn open_results(
     let fighters = results.copies.len();
     for (counted, &sum) in results.sums.iter_mut().take(fighters).zip(&sum.0) {
         *counted = sum;
+    }
+    // `exp_multiplier` (`assist.rs`): every fighter's sum, as the screen counts it up.
+    let times = assist::now().exp;
+    if times != 1.0 {
+        let had = results.sums;
+        for (sum, fighter) in results.sums.iter_mut().zip(&results.before) {
+            *sum = assist::experience(fighter, *sum, times);
+        }
+        info!(
+            "the assists: the sums of experience {had:x?} are {:x?} with {times} times the \
+             experience",
+            results.sums
+        );
     }
     let confirms = things.nobody_at_the_pad();
     let name = named.as_ref().map_or(&[][..], |named| &named.units);
@@ -2680,7 +3008,10 @@ fn roamers_of(
             let package = archive.read(disc, jc_formats::corridor::FILE)?;
             let of_floor = jc_formats::corridor::Tables::from_package(&package)
                 .map_err(|err| format!("the corridor's tables: {err:?}"))?;
+            let filled = *corridor.word() & roaming::FILL != 0;
             let (stands, anew) = corridor.pick(&of_floor, &mut state.list, positions.len(), draws);
+            let encounters = assist::now().encounters;
+            let stands = assist::thin(corridor.word(), stands, encounters, filled);
             (anew.then_some(state.list), stands, *corridor.word())
         }
         None => {
@@ -2690,7 +3021,16 @@ fn roamers_of(
             if room.flag != 0 || tables.row_of(number).is_none() {
                 return Ok(None);
             }
+            let filled = (state.word(at.area, at.place, room.slot))
+                .is_some_and(|word| word & roaming::FILL != 0);
             let stands = state.pick(&tables, slot, number, positions.len(), draws);
+            // `encounters = fewer` (`assist.rs`): half of a room filled anew, and the
+            // room's word with them.
+            let encounters = assist::now().encounters;
+            let stands = match state.word_mut(at.area, at.place, room.slot) {
+                Some(word) => assist::thin(word, stands, encounters, filled),
+                None => stands,
+            };
             let word = state.word(at.area, at.place, room.slot).unwrap_or(0);
             (anew, stands, word)
         }
@@ -2726,6 +3066,7 @@ fn roamers_of(
         mates,
         player_level,
         figures: Vec::new(),
+        versus: Vec::new(),
     };
     let stands: Vec<String> = stands
         .iter()
@@ -2908,6 +3249,16 @@ fn describe_room(
     let draws = source.carried.random;
     let left_by_effects = (source.carried.effect_half, source.carried.effect_kept);
     roamers.figures = figures_of(disc, &source.carried)?;
+    // The arena of a fight of two players: the local side's minions stand in the place
+    // of the carried creatures, the other side's beside them (`versus_view.rs`).
+    if let Some((own, other)) = versus_view::figures() {
+        lines.push(format!(
+            "room {number}: the arena, {} minions on this side and {} on the other",
+            own.len(),
+            other.len()
+        ));
+        (roamers.figures, roamers.versus) = (own, other);
+    }
     let exits = package.exits();
     for exit in &exits {
         // Without an entry of the variant table the first record of the slot is the target.
@@ -3326,58 +3677,6 @@ fn describe_keeping(package: &ScenePackage) -> Vec<String> {
     lines
 }
 
-/// F5 starts the whole game over: the app starts itself anew with the options it was
-/// given and ends, so that nothing of the session is left (a debug key of the build, not
-/// of the game).
-fn restart_on_key(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
-    if !keys.just_pressed(KeyCode::F5) {
-        return;
-    }
-    let started = std::env::current_exe().and_then(|exe| {
-        std::process::Command::new(exe)
-            .args(std::env::args_os().skip(1))
-            .spawn()
-    });
-    match started {
-        Ok(_) => {
-            info!("F5: the game starts over");
-            exit.write(AppExit::Success);
-        }
-        Err(err) => error!("F5: cannot start the game over: {err}"),
-    }
-}
-
-/// F2 makes the app's clock run faster, for a tester who has seen a scene before: 2, 4
-/// and 8 times, then as it was; F1 puts it back at once. Movies, scenes and walking all
-/// go by that clock (a debug key of the build, not of the game; a movie's sound does
-/// not keep step with it).
-fn speed_on_key(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut time: ResMut<Time<Virtual>>,
-    mut windows: Query<&mut Window>,
-) {
-    let speed = if keys.just_pressed(KeyCode::F1) {
-        1.0
-    } else if keys.just_pressed(KeyCode::F2) {
-        match time.relative_speed() {
-            speed if speed < 2.0 => 2.0,
-            speed if speed < 4.0 => 4.0,
-            speed if speed < 8.0 => 8.0,
-            _ => 1.0,
-        }
-    } else {
-        return;
-    };
-    time.set_relative_speed(speed);
-    info!("the clock runs {speed} times as fast");
-    for mut window in &mut windows {
-        window.title = match speed > 1.0 {
-            true => format!("Jade Cocoon (x{speed})"),
-            false => "Jade Cocoon".into(),
-        };
-    }
-}
-
 fn smoke_exit(mut smoke: ResMut<Smoke>, mut commands: Commands, mut exit: MessageWriter<AppExit>) {
     if smoke.frames_left > 0 {
         smoke.frames_left -= 1;
@@ -3387,7 +3686,7 @@ fn smoke_exit(mut smoke: ResMut<Smoke>, mut commands: Commands, mut exit: Messag
         exit.write(AppExit::Success);
         return;
     };
-    let Some(requested) = capture.requested else {
+    if capture.requested.is_none() {
         if let Some(dir) = capture.path.parent()
             && let Err(err) = std::fs::create_dir_all(dir)
         {
@@ -3396,14 +3695,23 @@ fn smoke_exit(mut smoke: ResMut<Smoke>, mut commands: Commands, mut exit: Messag
             return;
         }
         capture.requested = Some(SystemTime::now());
+    }
+    // One frame after the other is asked for, until all are.
+    if capture.taken < capture.frames {
+        let path = capture.path_of(capture.taken);
+        capture.taken += 1;
         commands
             .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(capture.path.clone()));
+            .observe(save_to_disk(path));
+        return;
+    }
+    let Some(requested) = capture.requested else {
         return;
     };
     // The capture is read back from the GPU a few frames later. An older file of the same
-    // name does not count: it has to be written after the request.
-    let written = std::fs::metadata(&capture.path)
+    // name does not count: it has to be written after the request. The last one asked
+    // for is waited for.
+    let written = std::fs::metadata(capture.path_of(capture.frames - 1))
         .and_then(|meta| Ok((meta.len(), meta.modified()?)))
         .is_ok_and(|(len, modified)| len > 0 && modified >= requested);
     if written {

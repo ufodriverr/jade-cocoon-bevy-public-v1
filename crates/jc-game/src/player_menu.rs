@@ -18,9 +18,10 @@ use jc_formats::menu::{self, Frames, Menu, Piece, Rect, Style};
 use jc_formats::model::ModelTable;
 use jc_formats::name;
 use jc_formats::notice;
+use jc_formats::options_panel;
 use jc_formats::options_screen::{self, OptionsScreen};
 use jc_formats::pad::{Pad, Repeat};
-use jc_formats::player_menu::{self, PlayerMenu, Tables, Things};
+use jc_formats::player_menu::{self, PlayerMenu, Spot, Tables, Things};
 use jc_formats::player_panel::{
     self, AttackRow, Counts, Detail, Drawn, Family, ItemRow, Listed, StoryRow, attacks, bar,
     detail, items, message, spells, story,
@@ -34,9 +35,12 @@ use jc_formats::window::{self, Faces};
 use crate::music::Music;
 use crate::name_entry::{Picture, SCREEN, WHOLE, blend, blit, letter};
 use crate::options_view::{
-    self, Look, Parts, ThingLook, blit_lit, inside, picture_in_row, thing_looks,
+    self, Look, Parts, Pc, ThingLook, blit_lit, inside, picture_in_row, thing_looks,
 };
+use crate::pc_settings::PcSettings;
 use crate::place_map::picture;
+use crate::pointer::{self, Aim, Pointer};
+use crate::prefs::Prefs;
 use crate::title::Press;
 
 /// The longest stretch of time one pass of the app may stand for.
@@ -370,6 +374,7 @@ pub struct MenuScreen {
     /// and the five numbers as the thing under the list's cursor would make them.
     equip: Option<EquipScreen>,
     options: Option<OptionsScreen>,
+    options_aim: Aim<options_panel::Spot>,
     ended: bool,
     /// What the options screen brings in its own file, and the settings of the app as
     /// the last pass left them, for the painter.
@@ -444,6 +449,10 @@ pub struct MenuScreen {
     time: f64,
     presses: Vec<Press>,
     shown: Entity,
+    /// The spot the mouse steers the cursor to (`pointer.rs`), on the menu's own
+    /// screens and on the screen behind "Equip".
+    aim: Aim<Spot>,
+    equip_aim: Aim<equip_panel::Spot>,
     /// Whether a room stands behind the menu, to which it leaves.
     over_room: bool,
     /// Where that room lies, for the task that leaves the forest, and whether the
@@ -1218,8 +1227,9 @@ impl MenuScreen {
         (self.sprites.get(number)).map_or(0, |sprite| sprite.wide as i16)
     }
 
-    /// The screen of this pass, four bytes a pixel.
-    fn paint(&self) -> Vec<u8> {
+    /// The screen of this pass, four bytes a pixel; the PC Settings are drawn over the
+    /// options while they are up.
+    fn paint(&self, pc: &PcSettings, prefs: &Prefs) -> Vec<u8> {
         let mut screen = [0, 0, 0, 255].repeat(SCREEN.0 * SCREEN.1);
         // The wall lies in the slot behind the frames', whole from the first pass on.
         for at in player_panel::wall() {
@@ -1255,7 +1265,13 @@ impl MenuScreen {
         // While the options screen is up it draws itself and the menu nothing.
         if let Some(options) = self.options.as_ref().filter(|_| self.menu.waits()) {
             let look = &self.options_look;
-            (self.parts()).options(&mut screen, look, options, &self.settings, time);
+            let pc = Pc {
+                settings: pc,
+                prefs,
+                signs: &self.signs,
+            };
+            let shown = (options, &self.settings);
+            (self.parts()).options(&mut screen, look, shown, time, pc);
             return screen;
         }
         // A message is added behind the panels, so it is drawn before them.
@@ -1790,6 +1806,7 @@ fn open(
         rank: rank_name,
         equip: None,
         options: None,
+        options_aim: Aim::default(),
         ended: false,
         options_look,
         settings: options_screen::Settings::at_boot(),
@@ -1841,6 +1858,8 @@ fn open(
         time: 0.0,
         presses: show.presses.clone(),
         shown,
+        aim: Aim::default(),
+        equip_aim: Aim::default(),
         over_room: running.is_some(),
         way_out: None,
         leaves_forest: false,
@@ -1948,8 +1967,12 @@ pub fn show_menu(
 }
 
 /// The pad's word of held buttons from the keyboard, or from the presses of a hidden run.
-fn buttons(current: &MenuScreen, keys: &ButtonInput<KeyCode>) -> u16 {
+fn buttons(current: &MenuScreen, keys: &crate::keys::Pad) -> u16 {
     let mut held = crate::keys::held(keys);
+    // The menu keys of the build back out of the menu as the triangle does.
+    if keys.menu_key() {
+        held |= jc_formats::pad::TRIANGLE;
+    }
     for press in &current.presses {
         if press.holds(current.time) {
             held |= press.button;
@@ -2026,12 +2049,20 @@ fn run_options(
     options: &mut OptionsScreen,
     settings: &mut options_screen::Settings,
     pad: &Pad,
-    music: &mut Music,
+    (music, pc, prefs): (&mut Music, &mut PcSettings, &mut ResMut<Prefs>),
 ) {
     let passes = current.passes;
     let who = "the player's menu";
     let drawn = options.clone();
-    let pass = options_view::pass(who, passes, options, settings, pad, music);
+    let screen = (&mut *options, &mut current.options_aim);
+    // Only a pass of the PC Settings that changes a setting marks the settings changed.
+    let mut preferred = (pc.is_open()).then(|| (**prefs).clone());
+    let mut unused = Prefs::default();
+    let kept = (music, pc, preferred.as_mut().unwrap_or(&mut unused));
+    let pass = options_view::pass(who, passes, screen, settings, pad, kept);
+    if let Some(preferred) = preferred.filter(|preferred| *preferred != **prefs) {
+        **prefs = preferred;
+    }
     if pass.ended {
         *options = drawn;
         current.ended = true;
@@ -2044,8 +2075,8 @@ fn run_options(
 pub fn run_menu(
     current: Option<ResMut<MenuScreen>>,
     mut music: ResMut<Music>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     over_room: Query<Entity, With<OverTheRoom>>,
@@ -2053,16 +2084,44 @@ pub fn run_menu(
     mut game: Option<ResMut<crate::Game>>,
     mut settings: ResMut<crate::settings::Settings>,
     mut commands: Commands,
+    pointer: Pointer,
+    (mut pc, mut prefs): (ResMut<PcSettings>, ResMut<Prefs>),
 ) {
     let Some(mut current) = current else {
         return;
     };
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(player_menu::PASSES_A_SECOND);
     // The frames are drawn in the window colour of the settings.
     current.settings = settings.0;
     let held = buttons(&current, &keys);
+    // The mouse over the spots of the menu's own screen, not over a list or a screen of
+    // its own that stands in front of it.
+    let under = pointer.on_picture(current.shown, SCREEN);
+    let own = !current.list_up && current.equip.is_none() && current.options.is_none();
+    let current = &mut *current;
+    if own {
+        let entries = [&current.entries[0][..], &current.entries[1][..]];
+        let (items, story) = (&current.item_lines, &current.story_lines);
+        let moves = [&current.spell_lines[..], &current.attack_lines[..]];
+        let spots = player_panel::spots(&current.menu, entries, (items, story), moves);
+        (current.aim).look(pointer.mouse(), pointer::row_under(spots, under));
+    } else {
+        current.aim.forget();
+    }
+    if let Some(options) = &current.options {
+        let lines = current.options_look.lines();
+        let aim = &mut current.options_aim;
+        options_view::look((aim, &mut pc), pointer.mouse(), under, options, lines);
+    }
+    match &current.equip {
+        Some(equip) => {
+            let spots = equip_panel::spots(equip, &current.worn_lines, &current.equip_lines);
+            (current.equip_aim).look(pointer.mouse(), pointer::row_under(spots, under));
+        }
+        None => current.equip_aim.forget(),
+    }
     // The pad routine has run in every pass before the menu's first: a button that is
     // still down from the room did not go down on the screen.
     current.pad.get_or_insert_with(|| {
@@ -2121,6 +2180,8 @@ pub fn run_menu(
             continue;
         }
         if let Some(mut equip) = current.equip.take() {
+            let here = equip_panel::here(&equip);
+            (current.equip_aim).steer(&mut pad, here, |spot| equip_panel::way(&equip, spot));
             run_equip(current, &mut equip, &pad, &mut music);
             current.equip = current.menu.waits().then_some(equip);
             continue;
@@ -2128,13 +2189,24 @@ pub fn run_menu(
         if let Some(mut options) = current.options.take() {
             // Only a pass that changes a setting marks the resource as changed.
             let mut set = settings.0;
-            run_options(current, &mut options, &mut set, &pad, &mut music);
+            let pc = (&mut *music, &mut *pc, &mut prefs);
+            run_options(current, &mut options, &mut set, &pad, pc);
             if set != settings.0 {
                 settings.0 = set;
             }
             current.settings = set;
             current.options = current.menu.waits().then_some(options);
             continue;
+        }
+        // The mouse steers the cursor while no message is up.
+        match current.menu.message {
+            true => current.aim.forget(),
+            false => {
+                let menu = &current.menu;
+                current
+                    .aim
+                    .steer(&mut pad, menu.spot(), |spot| menu.way_to(spot));
+            }
         }
         let mut held = Held {
             keeping: &mut current.carried.keeping,
@@ -2279,7 +2351,8 @@ pub fn run_menu(
             info!("the player's menu: pass {passes}: the options screen starts");
             let mut options = OptionsScreen::open(&settings.0);
             let mut set = settings.0;
-            run_options(current, &mut options, &mut set, &pad, &mut music);
+            let pc = (&mut *music, &mut *pc, &mut prefs);
+            run_options(current, &mut options, &mut set, &pad, pc);
             if set != settings.0 {
                 settings.0 = set;
             }
@@ -2380,6 +2453,7 @@ pub fn run_menu(
     }
     if let Ok(mut sprite) = sprites.get_mut(current.shown) {
         let (wide, high) = (SCREEN.0 as u32, SCREEN.1 as u32);
-        sprite.image = images.add(crate::picture_image(wide, high, current.paint()));
+        let painted = current.paint(&pc, &prefs);
+        sprite.image = images.add(crate::picture_image(wide, high, painted));
     }
 }

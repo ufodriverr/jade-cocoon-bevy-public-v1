@@ -866,6 +866,66 @@ pub fn drawn(
     drawn
 }
 
+/// A place of the screen's cursor as a pointer of the build names it (the game has
+/// none): the state and the row of the cursor.
+pub type Spot = (i16, i16);
+
+/// The spot the cursor is on.
+pub fn here(screen: &ShopScreen) -> Spot {
+    (screen.state, screen.cursor.at)
+}
+
+/// The directions that bring the cursor a step nearer to a spot of its state.
+pub fn way(screen: &ShopScreen, (state, at): Spot) -> u16 {
+    match state == screen.state {
+        true => screen.cursor.way_to(at),
+        false => 0,
+    }
+}
+
+/// Where the spots of the state lie, each with a rectangle that shows it, for a
+/// pointer of the build: the rows of the first menu and of the blacksmith's kinds, the
+/// rows of a list that hold a line, and the "Yes" and "No" of a question. None while a
+/// refusal is up, nor in the states of the amount and of the keeper's lines behind the
+/// putting on, which have a row or none. `lines` are the lines of the first menu, of
+/// the kinds and of a list.
+pub fn spots(screen: &ShopScreen, lines: [&[Vec<Piece>]; 3]) -> Vec<(Spot, Rect)> {
+    use crate::shop_screen::{
+        FIRST_OF_BLACKSMITH, FIRST_OF_SHOP, KINDS_TO_BUY, KINDS_TO_SELL, LIST_OF_KIND, OFFER,
+    };
+    if screen.refusal != 0 {
+        return Vec::new();
+    }
+    let state = screen.state;
+    let [first_lines, kind_lines, list_lines] = lines;
+    let lines = |lines: &[Vec<Piece>]| -> Vec<(Spot, Rect)> {
+        (lines.iter().zip(0..))
+            .filter_map(|(line, at)| {
+                crate::menu::bounds(line.iter().map(|piece| piece.rect))
+                    .map(|rect| ((state, at), rect))
+            })
+            .collect()
+    };
+    match state {
+        FIRST_OF_SHOP | FIRST_OF_BLACKSMITH => lines(first_lines),
+        KINDS_TO_BUY | KINDS_TO_SELL => lines(kind_lines),
+        OFFER..=LIST_OF_KIND => {
+            let cursor = screen.cursor;
+            let shown_lines = i32::from(cursor.lines) - i32::from(cursor.first);
+            let mut rows = lines(list_lines);
+            rows.retain(|((_, at), _)| i32::from(*at) < shown_lines);
+            rows
+        }
+        QUESTION..=PUT_ON => (0..2)
+            .map(|at| {
+                let y = ANSWER.y + ANSWER_STEP * at;
+                ((state, at), Rect { y, ..ANSWER })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The three texts of every line of the keeper a script's argument picks, from the
 /// screen's file, whose first byte is at `base`.
 pub fn keeper_texts(file: &[u8], base: u32, argument: i16) -> Option<Vec<[Vec<u16>; 3]>> {
@@ -983,6 +1043,44 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_pointer_finds_the_rows_of_the_menus_the_lists_and_the_answers() {
+        let (first, kinds, list) = (lines([23, 170, 53]), lines([22, 20, 3]), rows());
+        let shown = [&first[..], &kinds[..], &list[..]];
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        // The first menu: its three words, by the state.
+        let screen = ShopScreen::open(SHOP, 1, 1);
+        let spots = spots(&screen, shown);
+        assert_eq!(spots[1], ((0, 1), rect(10, 113, 47, 18)));
+        assert_eq!((spots.len(), here(&screen)), (3, (0, 0)));
+        assert_eq!(way(&screen, (0, 2)), crate::pad::DOWN);
+        assert_eq!(way(&screen, (KINDS_TO_BUY, 2)), 0);
+        // An offer of three: three rows of the four, each round its three pieces.
+        let screen = in_state(SHOP, OFFER, 3, 0, 0);
+        let spots = super::spots(&screen, shown);
+        assert_eq!(spots.len(), 3);
+        assert_eq!(spots[2], ((OFFER, 2), rect(10, 154, 179, 21)));
+        // Scrolled down by one in a list of six, all four rows hold a line; one more
+        // and the last row is past the list's end.
+        assert_eq!(
+            super::spots(&in_state(SHOP, ITEMS, 6, 0, 1), shown).len(),
+            4
+        );
+        assert_eq!(
+            super::spots(&in_state(SHOP, ITEMS, 6, 0, 3), shown).len(),
+            3
+        );
+        // A question: the bars of "Yes" and "No".
+        let question = in_state(SHOP, crate::shop_screen::QUESTION, 2, 0, 0);
+        let answers: Vec<_> = super::spots(&question, shown);
+        assert_eq!(answers[1], ((12, 1), rect(86, 53, 30, 16)));
+        // The amount has no rows, and nothing points while a refusal is up.
+        assert!(super::spots(&in_state(SHOP, AMOUNT, 0, 0, 0), shown).is_empty());
+        let mut refused = in_state(SHOP, OFFER, 3, 0, 0);
+        refused.refusal = crate::shop_screen::NO_MONEY;
+        assert!(super::spots(&refused, shown).is_empty());
     }
 
     #[test]

@@ -827,6 +827,19 @@ pub fn fight_paused(outcome: u32, boss: bool) -> Vec<FightAsks> {
     }
 }
 
+pub const VERSUS_MUSIC: usize = 153;
+
+/// What the fight of two players asks of the sound in front of its picture, once the
+/// fight's sequences are read (`0x800A4C48`): the room's music is given back and music
+/// 153 is asked for.
+pub fn versus_music() -> Vec<FightAsks> {
+    vec![FightAsks::GiveBack, FightAsks::Music(VERSUS_MUSIC)]
+}
+
+pub fn versus_over() -> Vec<FightAsks> {
+    vec![FightAsks::FadeMusic, FightAsks::Start(WON_ROW)]
+}
+
 /// The tear-down of a fight (`0x800BA958`).
 pub fn fight_torn_down() -> Vec<FightAsks> {
     vec![

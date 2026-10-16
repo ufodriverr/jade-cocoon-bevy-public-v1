@@ -748,6 +748,21 @@ impl Window {
         (self.wait == Wait::Picking && self.answers == AnswersBox::Open).then_some(self.answer)
     }
 
+    /// While the cursor is among the answers and their box is open: the line the
+    /// cursor is on, and the place of each answer that can be picked, the box's whole
+    /// width a line high where its letters stand. For a pointer of the build; the game
+    /// has none.
+    pub fn answer_lines(&self) -> Option<(i16, Vec<Rect>)> {
+        self.pointed()?;
+        let lines = self.asked.open_answers.count_ones() as i16;
+        let line = |line| Rect {
+            y: answer_at(self.answers_rect, line).1,
+            h: crate::message::LINE,
+            ..self.answers_rect
+        };
+        Some((self.cursor.max(0), (0..lines).map(line).collect()))
+    }
+
     /// Whether a page or the answers stand whole (`0x80034A8C`).
     pub fn stands(&self) -> bool {
         self.boxes == Boxes::Whole || self.answers == AnswersBox::Open
@@ -771,6 +786,12 @@ impl Window {
     /// The task has ended.
     pub fn is_gone(&self) -> bool {
         self.wait == Wait::Gone
+    }
+
+    /// Whether the window is a question: its group has answers to pick from (`0x39`,
+    /// `0x3A`), from its opening on, before the answers' box is up.
+    pub fn is_question(&self) -> bool {
+        self.asked.answers > 0
     }
 
     fn sound(&self, pass: &mut Pass, sound: u8) {

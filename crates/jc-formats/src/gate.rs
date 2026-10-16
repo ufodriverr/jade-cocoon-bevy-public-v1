@@ -315,13 +315,21 @@ impl Crossing {
         self.told = state;
     }
 
+    /// Whether a press of the confirm button would tell the object state 0, asked
+    /// without telling it: the test of [`Self::press`] (the build's hint of what the
+    /// press would do, `interaction_hint`).
+    pub fn would_press(&self) -> bool {
+        self.marked
+    }
+
     /// The second half of the pad routine's call for a talk (`0x800A5BD0`): a marked
     /// object is told state 0. Answers whether this one was.
     pub fn press(&mut self) -> bool {
-        if self.marked {
+        let marked = self.would_press();
+        if marked {
             self.told = 0;
         }
-        self.marked
+        marked
     }
 
     /// One game frame of the task: the wrapper that every object task of the package

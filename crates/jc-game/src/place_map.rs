@@ -14,6 +14,7 @@ use jc_formats::tim::{self, Tim};
 
 use crate::music::Music;
 use crate::name_entry::{Picture, SCREEN, WHOLE, blend, blit, letter};
+use crate::pointer::{self, Aim, Pointer};
 use crate::title::Press;
 
 /// The longest stretch of time one pass of the app may stand for.
@@ -130,6 +131,9 @@ pub struct PlaceMap {
     time: f64,
     presses: Vec<Press>,
     shown: Entity,
+    /// The place the mouse steers the cursor to (`pointer.rs`): a row of the list, or
+    /// with `true` an answer of the question.
+    aim: Aim<(bool, i16)>,
     /// The musics the screen's starts have asked for and the sounds its passes have
     /// played, until the sound has taken them.
     asked: Vec<u32>,
@@ -196,6 +200,22 @@ impl PlaceMap {
 
     fn cursor(&self) -> Cursor {
         self.cursors[self.now.map]
+    }
+
+    /// The cursor the next pass moves, whether it is the question's, and where its
+    /// places lie on the screen: the rows of the list or the two answers.
+    fn spots(&self) -> (Cursor, bool, Vec<((bool, i16), Rect)>) {
+        if let Step::Question { cursor, .. } = &self.step {
+            let answers = (0..2).map(|answer| ((true, answer as i16), map::answer(answer)));
+            return (*cursor, true, answers.collect());
+        }
+        let cursor = self.cursor();
+        let rows = (0..cursor.rows).filter(|&row| i32::from(row) < i32::from(cursor.lines));
+        (
+            cursor,
+            false,
+            rows.map(|row| ((false, row), map::row(row))).collect(),
+        )
     }
 
     /// The line under the cursor, its entry and the entry's name in letters.
@@ -626,6 +646,7 @@ fn open(
         time: 0.0,
         presses: show.presses.clone(),
         shown,
+        aim: Aim::default(),
         asked: Vec::new(),
         sounds: Vec::new(),
     };
@@ -654,7 +675,7 @@ pub fn show_place_map(
 }
 
 /// The pad's word of held buttons from the keyboard, or from the presses of a hidden run.
-fn buttons(current: &PlaceMap, keys: &ButtonInput<KeyCode>) -> u16 {
+fn buttons(current: &PlaceMap, keys: &crate::keys::Pad) -> u16 {
     let mut held = crate::keys::held(keys);
     for press in &current.presses {
         if press.holds(current.time) {
@@ -729,13 +750,14 @@ pub fn run_place_map(
     mut presses: Option<ResMut<MapPresses>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
-    cameras: Query<Entity, With<Camera2d>>,
+    cameras: Query<Entity, (With<Camera2d>, Without<crate::display::Presents>)>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
+    pointer: Pointer,
 ) {
     let Some(mut current) = current else {
         if let Some(asked) = asked {
@@ -751,10 +773,14 @@ pub fn run_place_map(
     if current.colour != colour {
         current.colour = colour;
     }
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(map::PASSES_A_SECOND);
     let held = buttons(&current, &keys);
+    // The mouse over the list's rows or the question's answers.
+    let (_, _, spots) = current.spots();
+    let under = pointer::row_under(spots, pointer.on_picture(current.shown, SCREEN));
+    current.aim.look(pointer.mouse(), under);
     // The screen clears the pad's repeat counters before its first pass, and the pad
     // routine has run in every pass before: a button that is still down from the room
     // did not go down on the screen.
@@ -770,6 +796,12 @@ pub fn run_place_map(
         painted = true;
         let mut pad = current.pad.unwrap_or_default();
         pad.read(held, Repeat::of(GAME_FRAME), current.passes);
+        let (cursor, question, _) = current.spots();
+        let way = |(asks, at)| match asks == question {
+            true => cursor.way_to(at),
+            false => 0,
+        };
+        current.aim.steer(&mut pad, (question, cursor.at), way);
         current.pad = Some(pad);
         if let Err(err) = current.pass(&pad) {
             error!("the place map: {err}");

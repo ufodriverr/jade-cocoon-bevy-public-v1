@@ -8,6 +8,8 @@ use crate::sound::{self, Bank, Sequence, SoundError};
 pub const VALUES_A_STEP: usize = (chip::RATE / sound::STEPS_A_SECOND) as usize;
 /// The main volume the library's start gives the chip, on both sides.
 pub const MAIN_VOLUME: u16 = 0x3FFF;
+/// The whole of a share of loudness ([`Player::set_shares`]).
+pub const WHOLE: u16 = 1 << 14;
 
 /// A sequence that was started, with the bank it plays on.
 #[derive(Debug, Clone)]
@@ -36,6 +38,12 @@ pub struct Player<'a> {
     reverb: Option<Reverb>,
     wet: u32,
     limited: u64,
+    /// The build's own volumes for a PC, not the console's: the share of loudness, of
+    /// [`WHOLE`], of the voices of the music and of all the others ([`Player::set_shares`]),
+    /// the numbers whose voices are the music's, and each voice's share in this step.
+    shares: [u16; 2],
+    music: Vec<u16>,
+    voice_shares: [u16; VOICES],
 }
 
 impl Default for Player<'_> {
@@ -58,6 +66,25 @@ impl<'a> Player<'a> {
             reverb: None,
             wet: 0,
             limited: 0,
+            shares: [WHOLE; 2],
+            music: Vec::new(),
+            voice_shares: [WHOLE; VOICES],
+        }
+    }
+
+    /// The build's own volumes for a PC (not the console's): from the next step on the
+    /// voices of the music sound at `music` of [`WHOLE`] and all others at `others`,
+    /// before the mix. The whole of both is the console's mix, value for value.
+    pub fn set_shares(&mut self, music: u16, others: u16) {
+        self.shares = [music.min(WHOLE), others.min(WHOLE)];
+    }
+
+    /// Whether the voices of the sequence or the sounds of that number are the music's
+    /// for [`Player::set_shares`]; none is until it is marked.
+    pub fn mark_music(&mut self, owner: u16, music: bool) {
+        self.music.retain(|known| *known != owner);
+        if music {
+            self.music.push(owner);
         }
     }
 
@@ -205,7 +232,17 @@ impl<'a> Player<'a> {
         for playing in &mut self.playing {
             playing.stepper.step(&mut self.voices);
         }
+        self.share_out();
         out.extend((0..VALUES_A_STEP).map(|_| self.tick()));
+    }
+
+    /// Each voice's share of loudness for the values of this step, by its number.
+    fn share_out(&mut self) {
+        let [music, others] = self.shares;
+        for (share, voice) in self.voice_shares.iter_mut().zip(self.voices.voices()) {
+            let of_music = voice.owner.is_some_and(|owner| self.music.contains(&owner));
+            *share = if of_music { music } else { others };
+        }
     }
 
     /// Gives the chip what the voices' step answered: the changed words, then "key
@@ -249,7 +286,10 @@ impl<'a> Player<'a> {
     pub fn tick(&mut self) -> [i16; 2] {
         let (mut sum, mut wet) = ([0i32; 2], [0i32; 2]);
         for (number, voice) in self.chip.iter_mut().enumerate() {
-            let sides = voice.tick();
+            let sides = match self.voice_shares[number] {
+                WHOLE => voice.tick(),
+                share => voice.tick().map(|side| (side * i32::from(share)) >> 14),
+            };
             sum = [sum[0] + sides[0], sum[1] + sides[1]];
             if self.wet & 1 << number != 0 {
                 wet = [wet[0] + sides[0], wet[1] + sides[1]];
@@ -552,5 +592,37 @@ mod tests {
         player.step(&mut out);
         player.step(&mut out);
         assert_eq!(player.sounding(), 1);
+    }
+
+    #[test]
+    fn the_shares_of_a_pc_turn_the_music_and_the_others_down_apart() {
+        let bank = bank(&[(5, &[(0, 0, 0, 127)])]);
+        let (body, bytes) = (body(4), set(&ONE_KEY));
+        let found = sound::sequences(&bytes).expect("set");
+        let heard = |shares: Option<(u16, u16)>, music: bool| {
+            let mut player = Player::new();
+            player.mark_music(7, music);
+            if let Some((music, others)) = shares {
+                player.set_shares(music, others);
+            }
+            assert!(player.start(7, &found[0], &bank, &body, [127, 127], 1) == Ok(true));
+            let mut out = Vec::new();
+            player.step(&mut out);
+            player.step(&mut out);
+            out[2 * VALUES_A_STEP - 1]
+        };
+        // The whole of both is the console's mix.
+        assert_eq!(heard(None, true), [16_377; 2]);
+        assert_eq!(heard(Some((WHOLE, WHOLE)), false), [16_377; 2]);
+        // A sequence marked as music has the music's share, any other the others'.
+        assert_eq!(heard(Some((WHOLE / 2, 0)), true), [8_188; 2]);
+        assert_eq!(heard(Some((WHOLE / 2, 0)), false), [0; 2]);
+        assert_eq!(heard(Some((0, WHOLE / 4)), false), [4_093; 2]);
+        // More than the whole is the whole, and a mark can be taken back.
+        assert_eq!(heard(Some((u16::MAX, WHOLE)), true), [16_377; 2]);
+        let mut player = Player::new();
+        player.mark_music(7, true);
+        player.mark_music(7, false);
+        assert!(player.music.is_empty());
     }
 }

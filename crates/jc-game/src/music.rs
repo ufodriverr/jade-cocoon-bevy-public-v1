@@ -11,6 +11,7 @@ use jc_formats::script;
 use jc_formats::sound::{self, Bank, Effect, EffectTable, MusicTable, SoundFile};
 use jc_formats::window::SETTING_AT_START;
 
+use crate::audio::Loudness;
 use crate::movie_sound::{Line, MovieSound};
 use crate::movie_view::Failure;
 
@@ -165,6 +166,9 @@ pub struct Music {
     steps: u64,
     loudest: u16,
     busiest: usize,
+    /// The shares of the music and of the sounds in the chip's mix, the volumes of a PC
+    /// (`audio.rs`).
+    shares: (u16, u16),
 }
 
 impl Music {
@@ -191,7 +195,26 @@ impl Music {
             steps: 0,
             loudest: 0,
             busiest: 0,
+            shares: (jc_formats::mixer::WHOLE, jc_formats::mixer::WHOLE),
         }
+    }
+
+    /// The shares of the music and of the sounds in the chip's mix (`audio.rs`).
+    pub fn shares(&self) -> (u16, u16) {
+        self.shares
+    }
+
+    /// The volumes of a PC for the music and for the sounds, as shares of
+    /// `jc_formats::mixer::WHOLE`: heard from the next step of the mix on.
+    pub fn set_shares(&mut self, shares: (u16, u16)) {
+        self.shares = shares;
+        self.player.set_shares(shares.0, shares.1);
+        info!(
+            "the volumes of a PC: the music at {} and the sounds at {} of {}",
+            shares.0,
+            shares.1,
+            jc_formats::mixer::WHOLE
+        );
     }
 
     /// The setting word the volumes are taken from.
@@ -297,13 +320,15 @@ impl Music {
         let found = sound::sequences(&kept.file[set])?;
         let sequence = found.get(asked);
         let sequence = sequence.ok_or("the music's row names no sequence of its file")?;
-        let volume = match which {
-            Which::Music => sound::music_volume(self.setting),
-            Which::Kept if number == 0 => sound::music_volume(self.setting),
-            _ => sound::sound_volume(self.setting),
+        let music = matches!((which, number), (Which::Music, _) | (Which::Kept, 0));
+        let volume = match music {
+            true => sound::music_volume(self.setting),
+            false => sound::sound_volume(self.setting),
         };
         let (bank, body) = kept.bank()?;
         let owner = owner(which, asked);
+        // What starts at the music's volume is the music for the volumes of a PC.
+        self.player.mark_music(owner, music);
         if !(self.player).start(owner, sequence, bank, body, [volume; 2], 1)? {
             return Err("the music's sequence is of the slow kind".into());
         }
@@ -453,11 +478,13 @@ impl Music {
         let found = sound::sequences(&kept.file[range])?;
         let sequence = found.get(asked);
         let sequence = sequence.ok_or("the row names no sequence of the fight's file")?;
-        let volume = match sound::fight_row_is_music(row) {
+        let music = sound::fight_row_is_music(row);
+        let volume = match music {
             true => sound::music_volume(self.setting),
             false => sound::sound_volume(self.setting),
         };
         let owner = owner(Which::Fight, row);
+        self.player.mark_music(owner, music);
         if !(self.player).start(owner, sequence, bank, body, [volume; 2], 1)? {
             return Err("the fight's sequence is of the slow kind".into());
         }
@@ -861,13 +888,21 @@ fn steps_of_a_pass(owed: f64, waiting: usize) -> u32 {
     steps
 }
 
-/// Steps the music for the time gone by and puts its sound on the line.
+/// Steps the music for the time gone by and puts its sound on the line. The time is the
+/// real clock's, not the game's: the music and the sounds keep their speed and their
+/// pitch while the game's clock runs fast (`pace.rs`), and a sound asked for in a game
+/// frame of a fast clock starts at once all the same. While the line is held (the window
+/// in the background, `audio.rs`) nothing is stepped, and the music goes on where it was.
 pub fn play_music(
     mut music: ResMut<Music>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
+    loudness: Res<Loudness>,
     mut sounds: ResMut<Assets<MovieSound>>,
     mut commands: Commands,
 ) {
+    if loudness.music.held() {
+        return;
+    }
     let music = &mut *music;
     if !music.held() && music.player.sounding() == 0 {
         // Nothing plays and nothing fades: the line is given back.
@@ -879,7 +914,7 @@ pub fn play_music(
         return;
     }
     let (line, _) = music.line.get_or_insert_with(|| {
-        let line = Line::new(chip::RATE);
+        let line = Line::with_gain(chip::RATE, &loudness.music);
         let player = AudioPlayer(sounds.add(MovieSound(line.clone())));
         (line, commands.spawn(player).id())
     });

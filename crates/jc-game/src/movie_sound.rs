@@ -1,7 +1,7 @@
 
 use std::collections::VecDeque;
 use std::num::NonZero;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,46 @@ pub const LEAD: f64 = 0.1;
 /// the samples (no sound device); then the oldest are dropped.
 const LONGEST_WAIT: f64 = 2.0;
 
+/// How loud the sound of a line is heard, and whether it is held, as the sound thread
+/// takes it: the build's own volumes and its pause for a PC (`audio.rs`). The sound
+/// thread reads it at every sample, so a change is heard at once, also of the sound
+/// that already waits on a line. Several lines can share one.
+#[derive(Debug)]
+pub struct Gain {
+    /// The share of full loudness, the bits of an `f32`.
+    share: AtomicU32,
+    /// Nothing is taken from the line, and silence is heard: the sound waits.
+    held: AtomicBool,
+}
+
+impl Default for Gain {
+    fn default() -> Self {
+        Self {
+            share: AtomicU32::new(1.0f32.to_bits()),
+            held: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Gain {
+    pub fn share(&self) -> f32 {
+        f32::from_bits(self.share.load(Ordering::Relaxed))
+    }
+
+    pub fn set_share(&self, share: f32) {
+        self.share
+            .store(share.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Relaxed);
+    }
+}
+
 struct Shared {
     /// Left and right sample of every moment that waits to be played.
     waiting: Mutex<VecDeque<[Sample; 2]>>,
@@ -29,11 +69,20 @@ struct Shared {
 pub struct Line {
     shared: Arc<Shared>,
     rate: u32,
+    gain: Arc<Gain>,
 }
 
 impl Line {
-    /// A line for sound of `rate` samples a second, with the lead on it.
+    /// A line for sound of `rate` samples a second, with the lead on it, heard at its
+    /// whole loudness.
+    #[cfg(test)]
     pub fn new(rate: u32) -> Self {
+        Self::with_gain(rate, &Arc::default())
+    }
+
+    /// A line for sound of `rate` samples a second, with the lead on it, heard as `gain`
+    /// says.
+    pub fn with_gain(rate: u32, gain: &Arc<Gain>) -> Self {
         let lead = (f64::from(rate) * LEAD) as usize;
         Self {
             shared: Arc::new(Shared {
@@ -42,6 +91,7 @@ impl Line {
                 taken: AtomicU64::new(0),
             }),
             rate,
+            gain: gain.clone(),
         }
     }
 
@@ -117,8 +167,9 @@ impl Decodable for MovieSound {
     }
 }
 
-/// The end of a line the sound thread reads: left and right sample in turn, silence while
-/// nothing waits, and the end once the line is closed.
+/// The end of a line the sound thread reads: left and right sample in turn at the line's
+/// gain, silence while nothing waits or the gain holds the line, and the end once the
+/// line is closed.
 pub struct Flow {
     line: Line,
     /// Moments of the lead still to come.
@@ -138,6 +189,11 @@ impl Iterator for Flow {
         if shared.over.load(Ordering::Relaxed) {
             return None;
         }
+        let gain = &self.line.gain;
+        if gain.held() {
+            self.right = Some(0.0);
+            return Some(0.0);
+        }
         let [left, right] = match shared.waiting.lock().ok()?.pop_front() {
             Some(moment) => {
                 if self.lead > 0 {
@@ -149,8 +205,9 @@ impl Iterator for Flow {
             }
             None => [0.0; 2],
         };
-        self.right = Some(right);
-        Some(left)
+        let share = gain.share();
+        self.right = Some(right * share);
+        Some(left * share)
     }
 }
 
@@ -220,5 +277,27 @@ mod tests {
         assert_eq!(line.shared.waiting.lock().unwrap().len(), 2000);
         let mut flow = line.flow();
         assert_eq!(flow.next(), Some(3000.0 / 32768.0));
+    }
+
+    #[test]
+    fn a_gain_turns_a_line_down_at_once_and_holds_it_without_taking() {
+        let gain = Arc::new(Gain::default());
+        let line = Line::with_gain(10, &gain);
+        let mut flow = line.flow();
+        line.push(&[16384, -16384, 8192, 8192], true, (1.0, 1.0));
+        // The lead of a tenth of a second: one moment.
+        assert_eq!(flow.by_ref().take(2).collect::<Vec<_>>(), [0.0; 2]);
+        // Half as loud from the next sample on, also for what waits already.
+        gain.set_share(0.5);
+        assert_eq!(flow.by_ref().take(2).collect::<Vec<_>>(), [0.25, -0.25]);
+        // Held: silence, and nothing is taken from the line.
+        gain.set_held(true);
+        assert_eq!(flow.by_ref().take(4).collect::<Vec<_>>(), [0.0; 4]);
+        assert_eq!((line.waiting(), line.taken()), (1, 1));
+        // Let go, the line goes on where it was; a share is never more than the whole.
+        gain.set_held(false);
+        gain.set_share(3.0);
+        assert_eq!(gain.share(), 1.0);
+        assert_eq!(flow.by_ref().take(2).collect::<Vec<_>>(), [0.25, 0.25]);
     }
 }

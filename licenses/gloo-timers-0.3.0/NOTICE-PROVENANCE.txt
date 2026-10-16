@@ -1,0 +1,6 @@
+Upstream package: gloo-timers 0.3.0
+Repository: https://github.com/rustwasm/gloo/tree/master/crates/timers
+Declared licence: MIT OR Apache-2.0
+This package omitted a standalone licence file. The exact published manifest
+and standard licence text or same-project notices are retained here.
+No copyright year or copyright holder has been invented. See NOTICE-ORIGINS.json.

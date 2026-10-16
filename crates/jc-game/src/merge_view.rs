@@ -28,6 +28,7 @@ use crate::options_view::{
 };
 use crate::place_map::picture;
 use crate::player_menu::{Bars, bars, put_bar, triangle};
+use crate::pointer::{self, Aim, Pointer};
 use crate::title::Press;
 
 /// The longest stretch of time one pass of the app may stand for.
@@ -81,6 +82,8 @@ pub struct MergeView {
     /// pass of the view shows.
     asleep: bool,
     comes_back: bool,
+    /// The spot of the mouse on its way to the screen's cursor (`pointer.rs`).
+    aim: Aim<merge_panel::Spot>,
 }
 
 /// The parts every screen of the menus is painted with, and what the screen brings in
@@ -364,12 +367,23 @@ impl MergeView {
             naming: None,
             asleep: false,
             comes_back: false,
+            aim: Aim::default(),
         })
     }
 
     /// Whether the screen's task sleeps while the room plays its part.
     pub fn asleep(&self) -> bool {
         self.asleep
+    }
+
+    /// Whether the name entry is up on a creature's name, and the entry itself, which
+    /// takes the keyboard (`name_entry.rs`).
+    pub fn names(&self) -> bool {
+        self.naming.is_some() && !self.asleep
+    }
+
+    pub fn naming_mut(&mut self) -> Option<&mut NameEntry> {
+        self.naming.as_mut().filter(|_| !self.asleep)
     }
 
     /// The script of the room asks for the sleeping screen again (`0x59` of kind 3,
@@ -814,14 +828,41 @@ pub fn over_the_room(
     Ok(())
 }
 
+/// Once a frame in front of the passes, while the screen is awake: the mouse over the
+/// spots of its state, or over the name entry's.
+pub fn point_merge(current: Option<ResMut<MergeView>>, pointer: Pointer) {
+    let Some(mut current) = current.filter(|current| !current.asleep) else {
+        return;
+    };
+    let under = pointer.on_picture(current.shown, SCREEN);
+    let view = &mut *current;
+    match view.naming.as_mut() {
+        Some(entry) => {
+            view.aim.forget();
+            entry.look(pointer.mouse(), under);
+        }
+        None => {
+            let look = &view.look;
+            let lines = [
+                &look.main_lines[..],
+                &look.carried_lines[..],
+                &look.kept_lines[..],
+                &look.skin_lines[..],
+            ];
+            let spots = merge_panel::spots(&view.screen, lines);
+            (view.aim).look(pointer.mouse(), pointer::row_under(spots, under));
+        }
+    }
+}
+
 /// Runs the passes of the screen for the time gone by.
 #[allow(clippy::too_many_arguments)]
 pub fn run_merge(
     current: Option<ResMut<MergeView>>,
     mut music: ResMut<Music>,
     settings: Res<crate::settings::Settings>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<(&mut Sprite, &Transform)>,
     mut over_room: Query<(Entity, Option<&mut Camera>), With<OverTheRoom>>,
@@ -843,7 +884,7 @@ pub fn run_merge(
         }
     }
     current.screen.magic_fx = settings.0.word & (1 << options_screen::MAGIC_FX) != 0;
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     current.time += passed;
     current.owed += passed * f64::from(PASSES_A_SECOND);
     let mut held = crate::keys::held(&keys);
@@ -887,6 +928,10 @@ pub fn run_merge(
         let white = current.screen.flags & flag::WHITE != 0;
         // The list of the minion skins is his things of kind 4 as they are now.
         current.screen.things = current.carried.keeping.clone();
+        // The mouse steers the cursor with the pad's own presses.
+        let view = &mut *current;
+        let here = merge_panel::here(&view.screen);
+        (view.aim).steer(&mut pad, here, |spot| merge_panel::way(&view.screen, spot));
         let pass = current.screen.pass(&pad);
         if let Some(merging) = pass.merges {
             // STAND-IN: the seed of the six draws of a new species is the pass, where

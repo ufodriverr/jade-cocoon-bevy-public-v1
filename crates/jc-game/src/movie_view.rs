@@ -1,8 +1,10 @@
 
 use std::fs::File;
+use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
+use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
@@ -14,7 +16,7 @@ use jc_formats::pad::{self, Pad, Repeat};
 use jc_formats::title;
 
 use crate::WINDOW_SIZE;
-use crate::movie_sound::{Line, MovieSound};
+use crate::movie_sound::{Gain, Line, MovieSound};
 
 /// What `--movie=N[:FRAME]` asks for: the movie's number in the movie table and the number
 /// of the frame to stand at, from 1. Without a frame the movie plays.
@@ -69,6 +71,11 @@ pub struct OverTheRoom;
 const OPENING: usize = 1;
 
 impl ShowMovie {
+    /// One frame of a movie stands on screen (`--movie=N:FRAME`).
+    pub fn still(&self) -> bool {
+        self.frame.is_some()
+    }
+
     /// The start of the game as the app has it: the opening movie, without the screen of
     /// file 56 and the two logo movies before it.
     pub fn opening() -> Self {
@@ -265,9 +272,12 @@ impl Source {
         Ok((picture, codes.header.scale, codes.used))
     }
 
-    /// The picture as the app draws it.
+    /// The picture as the app draws it. A movie is a film, not pixels drawn one by one,
+    /// and the picture is seldom a whole multiple of it (OPEN is 512 wide on a 4:3
+    /// screen): it is read smoothly, so that its columns do not come out uneven
+    /// (`display.rs`).
     fn image(&self, picture: &Picture) -> Image {
-        Image::new(
+        let mut image = Image::new(
             Extent3d {
                 width: picture.width as u32,
                 height: picture.height as u32,
@@ -277,7 +287,9 @@ impl Source {
             picture.rgba(self.record.depth),
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::RENDER_WORLD,
-        )
+        );
+        image.sampler = ImageSampler::linear();
+        image
     }
 
     /// The sprite of a picture: the shown area of the frame buffer fills the window and
@@ -382,8 +394,9 @@ pub fn show_movie(
 #[allow(clippy::too_many_arguments)]
 pub fn play_movie(
     playing: Option<ResMut<Playing>>,
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
+    keys: Res<crate::keys::Pad>,
+    loudness: Res<crate::audio::Loudness>,
     mut images: ResMut<Assets<Image>>,
     mut sounds: ResMut<Assets<MovieSound>>,
     mut sprites: Query<&mut Sprite>,
@@ -396,7 +409,7 @@ pub fn play_movie(
     if playing.over {
         return;
     }
-    let passed = time.delta_secs_f64().min(LONGEST_PASS);
+    let passed = crate::pace::passed(&time, LONGEST_PASS);
     playing.time += passed;
     playing.owed += passed * f64::from(playing.source.record.sectors_a_second());
     let start = match playing.press_start {
@@ -411,7 +424,8 @@ pub fn play_movie(
         pad.read(held, Repeat::of(1), 0);
         pad
     });
-    if let Err(err) = playing.read(held, &mut images, &mut sounds, &mut sprites, &mut commands) {
+    let sounds = (&mut *sounds, &loudness.movies);
+    if let Err(err) = playing.read(held, &mut images, sounds, &mut sprites, &mut commands) {
         error!("movie {}: {err}", playing.movie);
         playing.over = true;
         playing.hush(&mut commands);
@@ -455,6 +469,11 @@ pub fn back_to_the_room(
 }
 
 impl Playing {
+    /// The movie's pictures are on screen: it is not over.
+    pub fn on_screen(&self) -> bool {
+        !self.over
+    }
+
     /// The movie that is asked for, at the start of its stream.
     pub fn start(show: &ShowMovie) -> Result<Self, Failure> {
         let source = Source::open(show.movie)?;
@@ -544,7 +563,7 @@ impl Playing {
         &mut self,
         held: u16,
         images: &mut Assets<Image>,
-        sounds: &mut Assets<MovieSound>,
+        (sounds, gain): (&mut Assets<MovieSound>, &Arc<Gain>),
         sprites: &mut Query<&mut Sprite>,
         commands: &mut Commands,
     ) -> Result<(), Failure> {
@@ -565,7 +584,7 @@ impl Playing {
             let frame = match Sector::parse(&raw)? {
                 Sector::Video(sector) => self.demuxer.push(&sector),
                 Sector::Audio(sector) => {
-                    self.hear(&sector, sounds, commands);
+                    self.hear(&sector, (sounds, gain), commands);
                     None
                 }
                 Sector::Other => None,
@@ -659,7 +678,7 @@ impl Playing {
     fn hear(
         &mut self,
         sector: &AudioSector,
-        sounds: &mut Assets<MovieSound>,
+        (sounds, gain): (&mut Assets<MovieSound>, &Arc<Gain>),
         commands: &mut Commands,
     ) {
         let samples = self.sound.decoder.decode(sector);
@@ -673,7 +692,7 @@ impl Playing {
                 sector.rate(),
                 if self.sound.muted { ", muted for this run" } else { "" }
             );
-            let line = Line::new(sector.rate());
+            let line = Line::with_gain(sector.rate(), gain);
             let player = AudioPlayer(sounds.add(MovieSound(line.clone())));
             (line, commands.spawn(player).id())
         });

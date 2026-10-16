@@ -11,6 +11,24 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var texture_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> share: vec4<f32>;
 
+// The console's dither (`dither` of `[display]` with `render = "authentic"`: the fourth
+// share is 1). The offset of a 4 by 4 table by the pixel's place is added to the colour's
+// eight bits, which then keep five, widened as a texel is (`before.wgsl`). The table is
+// the console's GPU's. HYPOTHESIS: every piece of the 3D is dithered; which draw has the
+// dither bit on is not read from the disc.
+fn dithered(colour: vec3<f32>, at: vec2<f32>) -> vec3<f32> {
+    var table = array<f32, 16>(
+        -4.0, 0.0, -3.0, 1.0,
+        2.0, -2.0, 3.0, -1.0,
+        -3.0, 1.0, -4.0, 0.0,
+        3.0, -1.0, 2.0, -2.0,
+    );
+    let cell = vec2<u32>(at) % vec2(4u);
+    let eight = floor(colour * 255.0 + 0.5) + table[cell.y * 4u + cell.x];
+    let five = floor(clamp(eight, vec3(0.0), vec3(255.0)) / 8.0);
+    return (five * 8.0 + floor(five / 4.0)) / 255.0;
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(texture, texture_sampler, mesh.uv);
@@ -18,5 +36,9 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     if texel.a < 0.5 {
         discard;
     }
-    return vec4(texel.rgb * mesh.color.rgb, share.x);
+    var colour = texel.rgb * mesh.color.rgb;
+    if share.w > 0.5 {
+        colour = dithered(colour, mesh.position.xy);
+    }
+    return vec4(colour, share.x);
 }

@@ -76,6 +76,42 @@ You may also use [GitHub's formal content-removal channels](https://docs.github.
 without contacting the maintainer first, including when Issues are unavailable.
 This voluntary process does not replace those channels or limit anyone's rights.
 
+## Network and privacy
+
+The game uses the network only for **Arena Battle**, the two-player fight, and only
+after you choose to host or join a match. The rest of the game works offline.
+
+- **The other player sees your IP address.** Arena Battle connects your PC directly to
+  the other player's PC whenever it can. Like any direct connection, this lets the other
+  player's computer see your IP address, which can reveal your rough location and your
+  internet provider. Play only with people you trust with that. The name you choose for
+  the match is shown to the other player.
+- **Room-code play may use n0's public relay servers.** Room-code play uses the
+  [iroh](https://www.iroh.computer) library. When the two PCs cannot connect directly, the
+  connection passes through a public relay server run by n0, a third party that is not
+  part of this project. Relays only see encrypted traffic, not the contents of the fight.
+  Like any server, they see the IP addresses that connect to them. While you host, your
+  game also registers which relay it uses (not your IP address) with n0's public lookup
+  service, under a key made from the room code, so your friend's game can find it. Anyone
+  who has the room code can try to join, so give it only to the friend you play with.
+  Every hosting makes a new code.
+- **LAN discovery broadcasts on your local network.** When you look for hosts on the same
+  network, your game sends a short "who hosts?" message to every device on the local
+  network. A host answers with its player name, game version and port, so other devices
+  on that network can see that a match is being hosted.
+- **Hosting by address may open a router port.** When you host by address, the game asks
+  your router (UPnP) to forward TCP port 47820 to your PC so a friend outside your network
+  can join. The forward lasts for the hosting session (two hours at most) and the game
+  asks the router to remove it when hosting stops. While it is open, anyone on the
+  internet can reach that port. In room-code play the networking library may also ask
+  the router for a port mapping (UPnP, PCP or NAT-PMP) to help the direct connection.
+- **No accounts, no telemetry.** There are no accounts or sign-ins. The project does not
+  collect, send or sell usage data, and it runs no servers of its own. Your settings,
+  saves and logs stay on your PC.
+
+Windows may ask whether `jc-game` may use the network the first time you host or join.
+Allowing it for **Private networks** is enough for play at home.
+
 ## Scope of this notice
 
 This notice states project policy; it is not authorisation from the original game's

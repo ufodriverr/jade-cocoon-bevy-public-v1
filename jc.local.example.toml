@@ -3,3 +3,12 @@
 # European release SLES-02201, raw MODE2/2352 .bin.
 disc_image = 'X:\path\to\Jade Cocoon - Story of the Tamamayu (Europe).bin'
 cache_dir = 'cache'
+
+# Optional: how the keyboard steers the hero. Only the first start reads this table; it
+# then becomes [controls] of settings.toml, which the PC Settings change from then on.
+# movement = 'modern': W A S D / arrows go the way the screen shows, the hero turns by itself.
+# movement = 'tank':   up/down walk forward/back, the sides turn.
+# always_run = true:   the directions run and Shift walks; false: they walk and Shift runs.
+# [controls]
+# movement = 'modern'
+# always_run = true

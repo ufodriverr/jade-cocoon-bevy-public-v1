@@ -205,13 +205,21 @@ impl Swing {
         self.marked = at && !self.opening && !script_runs;
     }
 
+    /// Whether a press of the confirm button would tell the object state 0, asked
+    /// without telling it: the test of [`Self::press`] (the build's hint of what the
+    /// press would do, `interaction_hint`).
+    pub fn would_press(&self) -> bool {
+        self.marked
+    }
+
     /// The second half of the pad routine's call for a talk (`0x800A5BD0`): a marked
     /// object is told state 0. Answers whether this one was.
     pub fn press(&mut self) -> bool {
-        if self.marked {
+        let marked = self.would_press();
+        if marked {
             self.told = Some(ASKED);
         }
-        self.marked
+        marked
     }
 
     /// A script tells the door a state (`0x2E`).
@@ -277,15 +285,19 @@ mod tests {
     fn a_press_tells_a_door_the_player_looks_at_state_0() {
         let door = Door::parse(&record()).expect("a door");
         let mut swing = Swing::new(&door, false);
-        // Nobody at the door: a press does nothing.
+        // Nobody at the door: a press does nothing, and the question without a press
+        // says so and tells nothing.
         swing.look(false, false);
+        assert!(!swing.would_press());
         assert!(!swing.press());
         assert!(!swing.pass(&door).asks);
         // At the door while its script runs: not marked.
         swing.look(true, true);
-        assert!(!swing.press());
+        assert!(!swing.would_press() && !swing.press());
         // At the door: the press tells state 0, and the next pass asks for the script.
         swing.look(true, false);
+        assert!(swing.would_press());
+        assert_eq!(swing.told, None, "asking tells nothing");
         assert!(swing.press());
         assert!(swing.pass(&door).asks);
         // The script tells it to open: an opening door is not marked again.

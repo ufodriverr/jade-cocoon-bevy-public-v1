@@ -8,6 +8,7 @@ use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dPlugin};
 use jc_formats::background::SCREEN;
 
+use crate::display::Frame;
 use crate::field::{self, Fitted, ScreenCamera};
 use crate::shown::{self, Things};
 
@@ -74,6 +75,28 @@ pub struct Laying {
     frames: u32,
     lays: Handle<BeforeMaterial>,
     shows: Handle<BeforeMaterial>,
+    /// The pixels of the pictures.
+    size: UVec2,
+}
+
+/// The pixels the pictures of the picture before have: those of the 4:3 part of the
+/// picture of every screen, none until it is laid into the window; the console's without
+/// that picture.
+fn pixels(screens: Option<&Frame>) -> Option<UVec2> {
+    match screens {
+        Some(screens) => screens.square_pixels(),
+        None => Some(UVec2::new(SCREEN.0 as u32, SCREEN.1 as u32)),
+    }
+}
+
+/// A picture the room or the laying camera draws into.
+fn kept_picture(images: &mut Assets<Image>, size: UVec2) -> Handle<Image> {
+    images.add(Image::new_target_texture(
+        size.x,
+        size.y,
+        TextureFormat::Rgba8UnormSrgb,
+        None,
+    ))
 }
 
 /// The camera that shows the kept picture in the window.
@@ -99,7 +122,7 @@ type ShowingCamera = (With<Shows>, Without<ScreenCamera>, Without<Laying>);
 /// (and the right one in the end when the first try came before the graphics card had the
 /// room's pictures).
 fn lay(
-    things: Option<Res<Things>>,
+    (things, screens): (Option<Res<Things>>, Option<Res<Frame>>),
     mut commands: Commands,
     (mut images, mut meshes, mut materials): Pictures,
     mut room: Query<(Entity, &mut Camera), RoomCamera>,
@@ -113,17 +136,14 @@ fn lay(
             let Ok((entity, mut camera)) = room.single_mut() else {
                 return;
             };
-            let (across, down) = (SCREEN.0 as u32, SCREEN.1 as u32);
-            let mut picture = || {
-                images.add(Image::new_target_texture(
-                    across,
-                    down,
-                    TextureFormat::Rgba8UnormSrgb,
-                    None,
-                ))
+            // The picture of every screen is laid into the window in the first frames.
+            let Some(size) = pixels(screens.as_deref()) else {
+                return;
             };
+            let (across, down) = (SCREEN.0 as f32, SCREEN.1 as f32);
+            let mut picture = || kept_picture(&mut images, size);
             let (drawn, kept) = (picture(), [picture(), picture()]);
-            let square = meshes.add(Rectangle::new(across as f32, down as f32));
+            let square = meshes.add(Rectangle::new(across, down));
             // The first frame has nothing before it. HYPOTHESIS: on the console it has
             // whatever the other buffer held, which is not known here.
             let lays = materials.add(BeforeMaterial {
@@ -162,6 +182,7 @@ fn lay(
                     frames: 1,
                     lays: lays.clone(),
                     shows: shows.clone(),
+                    size,
                 },
             ));
             commands.spawn((
@@ -191,9 +212,41 @@ fn lay(
                 MeshMaterial2d(shows),
                 RenderLayers::layer(SHOWING),
             ));
-            info!("the picture before: kept from game frame {frame} on");
+            info!(
+                "the picture before: kept from game frame {frame} on, {}x{} pixels",
+                size.x, size.y
+            );
         }
         (Some(frame), Ok((_, mut state, mut target))) => {
+            // A picture of every screen of another size (the window changed): the
+            // pictures are made anew, the one before black.
+            if let Some(size) = pixels(screens.as_deref()).filter(|size| *size != state.size) {
+                let drawn = kept_picture(&mut images, size);
+                state.kept = [
+                    kept_picture(&mut images, size),
+                    kept_picture(&mut images, size),
+                ];
+                state.size = size;
+                let (new, old) = (
+                    state.kept[state.now].clone(),
+                    state.kept[1 - state.now].clone(),
+                );
+                if let Some(mut lays) = materials.get_mut(&state.lays) {
+                    lays.now = drawn.clone();
+                    lays.before = old;
+                }
+                if let Some(mut shows) = materials.get_mut(&state.shows) {
+                    shows.now = new.clone();
+                    shows.before = new.clone();
+                }
+                *target = RenderTarget::Image(new.into());
+                if let Ok((room, _)) = room.single() {
+                    commands
+                        .entity(room)
+                        .insert(RenderTarget::Image(drawn.into()));
+                }
+                info!("the picture before: {}x{} pixels now", size.x, size.y);
+            }
             if state.laid == frame {
                 return;
             }

@@ -822,8 +822,37 @@ const SCREEN_WIDTH: i32 = 320;
 /// piece reaches one pixel further right than its width, and from its width over the
 /// strip's point to one pixel under it.
 pub fn strip_piece(turn: i32, piece: usize, distance: i32) -> Option<(i32, i32)> {
-    let left = ((turn & 0xFFF) / 4 + STRIP_STEP * piece as i32 - 1024) * distance / STRIP_AT;
-    (-STRIP_STEP..SCREEN_WIDTH)
+    strip_piece_reaching(turn, piece as i32, distance, 0)
+}
+
+/// The pieces of the strip to try for a picture that reaches `reach` pixels beyond either
+/// edge of the console's screen (the widescreen fights of the build for a PC), at the
+/// projection distance `distance`: the console's 32, and with a reach as many before
+/// the first and behind the last as cover it, which go on through the strip's pictures
+/// in turn. [`strip_piece_reaching`] leaves out those beyond the picture.
+pub fn strip_pieces(distance: i32, reach: i32) -> std::ops::Range<i32> {
+    let all = STRIP_PIECES as i32;
+    match reach {
+        0 => 0..all,
+        // The first piece lies at most a pixel left of the screen's edge.
+        _ => {
+            let more = (STRIP_STEP + reach) * STRIP_AT / distance.max(1) / STRIP_STEP + 1;
+            -more..all + more
+        }
+    }
+}
+
+/// [`strip_piece`] for a picture that reaches `reach` pixels beyond either edge of the
+/// screen: a piece is left out beyond either edge of the wider picture. With a reach of
+/// 0 it is the console's rule.
+pub fn strip_piece_reaching(
+    turn: i32,
+    piece: i32,
+    distance: i32,
+    reach: i32,
+) -> Option<(i32, i32)> {
+    let left = ((turn & 0xFFF) / 4 + STRIP_STEP * piece - 1024) * distance / STRIP_AT;
+    (-STRIP_STEP - reach..SCREEN_WIDTH + reach)
         .contains(&left)
         .then_some((left, STRIP_STEP * distance / STRIP_AT))
 }
@@ -1480,5 +1509,44 @@ mod tests {
         assert_eq!(strip_piece(0, 14, 300), None);
         // The turn counts by its low twelve bits.
         assert_eq!(strip_piece(4096 + 4, 11, 300), strip_piece(4, 11, 300));
+    }
+
+    #[test]
+    fn a_wider_picture_has_the_strip_beyond_the_screens_edges() {
+        // Without a reach it is the console's rule over the console's 32 pieces.
+        assert_eq!(strip_pieces(300, 0), 0..32);
+        for piece in 0..32 {
+            for turn in [0, 4, 2048, 4095] {
+                assert_eq!(
+                    strip_piece_reaching(turn, piece, 300, 0),
+                    strip_piece(turn, piece as usize, 300)
+                );
+            }
+        }
+        // 54 pixels beyond either edge (16:9): the pieces just outside come in.
+        assert_eq!(strip_piece(40, 9, 240), None);
+        assert_eq!(strip_piece_reaching(40, 9, 240, 54), Some((-150, 96)));
+        assert_eq!(strip_piece(0, 14, 240), None);
+        assert_eq!(strip_piece_reaching(0, 14, 240, 54), Some((320, 96)));
+        assert_eq!(strip_piece_reaching(0, 15, 240, 54), None);
+        // Turned so that the first piece is at the screen's left edge, the pieces before
+        // it fill the reach; every pixel of the wider picture has a piece.
+        for (turn, distance, reach) in [(4095, 300, 54), (4095, 160, 54), (4095, 240, 125)] {
+            let mut lefts: Vec<(i32, i32)> = strip_pieces(distance, reach)
+                .filter_map(|piece| strip_piece_reaching(turn, piece, distance, reach))
+                .collect();
+            lefts.sort();
+            assert!(lefts[0].0 <= -reach, "{turn} {distance} {reach}");
+            let last = lefts.last().unwrap();
+            assert!(
+                last.0 + last.1 + 1 >= 320 + reach,
+                "{turn} {distance} {reach}"
+            );
+            assert!(
+                lefts
+                    .windows(2)
+                    .all(|two| two[0].0 + two[0].1 + 1 >= two[1].0)
+            );
+        }
     }
 }

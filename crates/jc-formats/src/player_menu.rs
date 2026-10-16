@@ -343,6 +343,11 @@ pub struct PlayerMenu {
     pub cursor: Cursor,
 }
 
+/// A place of the menu's cursor, as a pointer of the build names it (the game has
+/// none): the row of the first level it is in, 0 the player's, 1 the creatures' and 2
+/// the third, 0 on every other screen; and the cursor's place.
+pub type Spot = (u8, i16);
+
 /// The kept cursors by what they are of.
 const KEPT_ENTRY: usize = 0;
 const KEPT_CREATURE: usize = 1;
@@ -551,6 +556,27 @@ impl PlayerMenu {
             passed.lists = true;
         }
         passed
+    }
+
+    /// The place of the cursor as a pointer of the build names it ([`Spot`]).
+    pub fn spot(&self) -> Spot {
+        let row = match self.screen {
+            FIRST_LEVEL if self.flags & flag::CREATURES_ROW != 0 => 1,
+            FIRST_LEVEL if self.flags & flag::THIRD_ROW != 0 => 2,
+            _ => 0,
+        };
+        (row, self.cursor.at)
+    }
+
+    /// The directions that bring the cursor a step nearer to a spot: on the first level
+    /// up and down change the row.
+    pub fn way_to(&self, (row, at): Spot) -> u16 {
+        let (here, _) = self.spot();
+        match row.cmp(&here) {
+            std::cmp::Ordering::Less => pad::UP,
+            std::cmp::Ordering::Greater => pad::DOWN,
+            std::cmp::Ordering::Equal => self.cursor.way_to(at),
+        }
     }
 
     /// The cursor record of the screen; the first level's is made from its row.

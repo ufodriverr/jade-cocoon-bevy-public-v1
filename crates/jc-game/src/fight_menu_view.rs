@@ -2,11 +2,11 @@
 use bevy::prelude::*;
 use jc_disc::{Archive, DiscImage, Executable, LocalConfig};
 use jc_formats::battle::hud;
-use jc_formats::battle::menu::Menu;
+use jc_formats::battle::menu::{Menu, level};
 use jc_formats::battle::menu_panel::{self, Drawn, LEVELS, Shapes, Tables};
 use jc_formats::menu::{self, Frames, Piece, Rect, Style, brightness, frame_time, piece};
 use jc_formats::message;
-use jc_formats::name::{self, LegendPiece};
+use jc_formats::name;
 use jc_formats::notice;
 use jc_formats::player_panel::{self, attacks, items, spells};
 use jc_formats::rooms;
@@ -19,6 +19,7 @@ use crate::options_view::{
 };
 use crate::place_map::picture;
 use crate::player_menu::{Bars, bars, put_bar};
+use crate::prompts::{self, Laid};
 use crate::scripts::FightMenu;
 use crate::shown::Things;
 use crate::text_view::half;
@@ -39,6 +40,8 @@ struct Look {
     font: Font,
     font_picture: Picture,
     tables: Tables,
+    /// The tables of a minion's menu in the fight of two players: a sixth cell "Item".
+    duel_tables: Tables,
     legends: [Vec<(usize, Vec<u16>)>; LEVELS],
     /// The executable's four lines of a list of items, the small picture and the name
     /// of every item, and what a dim row is painted with: the font's second row of
@@ -135,6 +138,7 @@ impl Look {
             sprites,
             frames,
             font,
+            duel_tables: tables.for_duel(),
             tables,
             legends,
         })
@@ -167,7 +171,8 @@ impl Look {
     }
 
     /// The line of help of a level in a window colour (`0x8002B064`): its frame, added
-    /// last, lies under the signs and the words.
+    /// last, lies under the signs and the words, the signs as the prompts' style has
+    /// them (`prompts.rs`).
     fn legend(&self, screen: &mut [u8], colour: i16, pairs: &[(usize, Vec<u16>)]) {
         let legend = name::legend(colour);
         self.frame(screen, legend.rect, legend.style, 0);
@@ -175,10 +180,11 @@ impl Look {
             let sprite = self.sprites.get(number)?;
             Some((sprite.wide as i16, sprite.high as i16))
         };
-        for piece in name::legend_pieces(pairs, &self.font, sizes).unwrap_or_default() {
+        for piece in prompts::legend(pairs, &self.font, sizes, false) {
             match piece {
-                LegendPiece::Sign { sprite, at } => self.sprite(screen, sprite, at, WHOLE),
-                LegendPiece::Word { units, at } => {
+                Laid::Sprite { sprite, at } => self.sprite(screen, sprite, at, WHOLE),
+                Laid::Glyph { glyph, at } => prompts::put(screen, &glyph, at, WHOLE),
+                Laid::Word { units, at } => {
                     glyphs(screen, &self.font, &self.font_picture, &units, at, WHOLE);
                 }
             }
@@ -390,6 +396,30 @@ impl Look {
         }
     }
 
+    /// The tables of the menu on screen: a minion's of the fight of two players has one
+    /// cell more.
+    fn tables_of(&self, shown: &FightMenu) -> &Tables {
+        match shown.duel {
+            true => &self.duel_tables,
+            false => &self.tables,
+        }
+    }
+
+    /// Where the spots of the menu's last pass lie (`pointer.rs`), with the places of
+    /// the opponents on the fight's picture.
+    fn spots(
+        &self,
+        shown: &FightMenu,
+        opponents: &[(usize, Rect)],
+    ) -> Vec<(menu_panel::Spot, Rect)> {
+        let Some(menu) = shown.menu else {
+            return Vec::new();
+        };
+        let moves = shown.moves.as_ref().map(|moves| (&self.shapes, moves));
+        let list = (&self.list[..], &shown.items, moves);
+        menu_panel::spots(menu, self.tables_of(shown), list, &shown.own, opponents)
+    }
+
     /// The screen of the menu's last pass, four bytes a pixel, clear where the fight
     /// shows through. `colour` is the window colour of the settings and `named` the name
     /// the player was given, empty for the one a new game starts with.
@@ -418,7 +448,7 @@ impl Look {
         let list = (&self.list[..], &shown.items, moves);
         let panel = menu_panel::drawn(
             menu,
-            &self.tables,
+            self.tables_of(shown),
             list,
             &shown.own,
             time,
@@ -493,20 +523,45 @@ pub struct Painter {
     /// menu. And whether the menu was in the last picture, for the log.
     painted: Option<u32>,
     menu: bool,
+    /// The places of the opponents a pointer finds a target in, as the log last said.
+    targets: Vec<(menu_panel::Spot, Rect)>,
 }
 
 /// Paints the command menu of the room's fight over the room, as the last game frame
 /// left it, in the window colour of the game's settings.
 pub fn paint_fight_menu(
-    things: Option<Res<Things>>,
+    mut things: Option<ResMut<Things>>,
     settings: Res<crate::settings::Settings>,
     named: Option<Res<crate::name_entry::Named>>,
     mut painter: Local<Painter>,
     mut images: ResMut<Assets<Image>>,
     mut sprites: Query<&mut Sprite>,
     mut commands: Commands,
+    pointer: crate::pointer::Pointer,
 ) {
     let painter = &mut *painter;
+    // Once a frame, between the game frames: the mouse over the menu's spots, and over
+    // the opponents as far as the fight's picture reaches.
+    if let (Some(look), Some(things)) = (&painter.look, things.as_mut()) {
+        let opponents = things.opponents_on_screen();
+        let shown = things.fight_menu().filter(|shown| shown.menu.is_some());
+        if let Some(spots) = shown.map(|shown| look.spots(&shown, &opponents)) {
+            let target = |(spot, _): &&(menu_panel::Spot, Rect)| spot.0 == level::TARGET;
+            let targets: Vec<_> = spots.iter().filter(target).copied().collect();
+            // The log has the places once, as they come up.
+            let places = |spots: &[(menu_panel::Spot, Rect)]| -> Vec<menu_panel::Spot> {
+                spots.iter().map(|(spot, _)| *spot).collect()
+            };
+            if places(&targets) != places(&painter.targets) && !targets.is_empty() {
+                info!(
+                    "the menu of the fight: the mouse finds the targets (place, rectangle) {targets:?}"
+                );
+            }
+            painter.targets = targets;
+            let under = crate::pointer::row_under(spots, pointer.on_fight());
+            (things.bypass_change_detection()).point_at_fight(pointer.mouse(), under);
+        }
+    }
     let mut show = |screen: Vec<u8>, sprite: &mut Option<Entity>| {
         let image = images.add(crate::picture_image(
             SCREEN.0 as u32,

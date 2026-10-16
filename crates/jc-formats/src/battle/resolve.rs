@@ -105,7 +105,7 @@ pub fn times(a: f64, b: f64) -> f64 {
         return product;
     }
     // What the rounding cut off, exactly.
-    let rest = a.mul_add(b, -product);
+    let rest = product_rest(a, b, product);
     let away = if product > 0.0 {
         product.next_up()
     } else {
@@ -116,6 +116,22 @@ pub fn times(a: f64, b: f64) -> f64 {
     } else {
         product
     }
+}
+
+fn product_rest(a: f64, b: f64, product: f64) -> f64 {
+    const HUGE: f64 = 1e150;
+    if a.abs() > HUGE || b.abs() > HUGE {
+        return a.mul_add(b, -product);
+    }
+    // 2^27 + 1 cuts a double into two halves of 26 bits each.
+    const SPLIT: f64 = 134_217_729.0;
+    let halves = |x: f64| {
+        let c = SPLIT * x;
+        let high = c - (c - x);
+        (high, x - high)
+    };
+    let ((ah, al), (bh, bl)) = (halves(a), halves(b));
+    al * bl - (((product - ah * bh) - al * bh) - ah * bl)
 }
 
 /// The game's square root (`0x8005E52C`): Newton's steps from the larger of the number
@@ -524,6 +540,44 @@ mod tests {
         assert_eq!(times(1.0 + step, 1.5), 1.5 + 2.0 * step);
         assert_eq!(times(3.0, 0.25), 0.75);
         assert_eq!(times(0.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn the_rest_of_a_product_is_the_fused_one_without_the_fused_operation() {
+        // Numbers of the size of a fight's (powers, strengths, shares of a root) and of
+        // every size around them, against the processor's fused multiply-add.
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200_000 {
+            let mut number = || {
+                let bits = next();
+                let size = (bits % 64) as i32 - 32;
+                let mantissa = 1.0 + (bits >> 11) as f64 / (1u64 << 53) as f64;
+                let sign = if bits & 1 == 0 { 1.0 } else { -1.0 };
+                sign * mantissa * 2f64.powi(size)
+            };
+            let (a, b) = (number(), number());
+            let product = a * b;
+            // (A rest of nothing may come with either sign; `times` takes both alike.)
+            assert_eq!(
+                product_rest(a, b, product),
+                a.mul_add(b, -product),
+                "{a} * {b}"
+            );
+        }
+        for (a, b) in [
+            (7.0, 0.25),
+            (10.0 / 3.0, 3.0),
+            (0.1, 0.2),
+            (2f64.sqrt(), 2f64.sqrt()),
+        ] {
+            assert_eq!(product_rest(a, b, a * b), a.mul_add(b, -(a * b)));
+        }
     }
 
     #[test]

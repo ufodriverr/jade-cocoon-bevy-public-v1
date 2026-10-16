@@ -7,6 +7,9 @@ use crate::save;
 
 /// The slots of a card for this game's saves.
 pub const SLOTS: usize = 15;
+pub const EXTRA: usize = 4;
+/// The most rows a list has.
+pub const ROWS_MOST: usize = SLOTS + EXTRA;
 /// The bytes of a slot's head in the list of heads.
 pub const HEAD: usize = 128;
 /// The buffer of a save, and what a file of one block holds of it.
@@ -96,27 +99,45 @@ pub enum Shape {
 
 /// A text of the build's own in the units of the game's texts: the wide letters of the
 /// game's font, a unit a letter. Only for what the game has no text for.
-const fn wide<const N: usize>(letters: &[u8; N]) -> [u16; N] {
+pub const fn wide<const N: usize>(letters: &[u8; N]) -> [u16; N] {
     let mut units = [0; N];
     let mut n = 0;
     while n < N {
-        let letter = letters[n];
-        let code: u16 = match letter {
-            b'A'..=b'Z' => 0x8260 + (letter - b'A') as u16,
-            b'a'..=b'z' => 0x8281 + (letter - b'a') as u16,
-            b'?' => 0x8148,
-            _ => 0x8140,
-        };
-        units[n] = code.swap_bytes();
+        units[n] = wide_unit(letters[n]);
         n += 1;
     }
     units
+}
+
+/// The unit of the wide letter of a letter of ASCII: the letters, the digits and a few
+/// signs; anything else is a space.
+pub const fn wide_unit(letter: u8) -> u16 {
+    let code: u16 = match letter {
+        b'A'..=b'Z' => 0x8260 + (letter - b'A') as u16,
+        b'a'..=b'z' => 0x8281 + (letter - b'a') as u16,
+        b'0'..=b'9' => 0x824F + (letter - b'0') as u16,
+        b'?' => 0x8148,
+        b':' => 0x8146,
+        b'.' => 0x8144,
+        b',' => 0x8143,
+        b'-' => 0x817C,
+        b'/' => 0x815E,
+        _ => 0x8140,
+    };
+    code.swap_bytes()
 }
 
 /// The question in front of a save that is deleted, and the word of the legend for it:
 /// the build's, for its screen for a PC.
 pub static ASKS_DELETE: [u16; 17] = wide(b"Delete this save?");
 pub static DELETE_WORD: [u16; 6] = wide(b"Delete");
+
+/// The names of the build's rows above the slots ([`EXTRA`]), in their order.
+static QUICK: [u16; 5] = wide(b"Quick");
+static AUTO_1: [u16; 6] = wide(b"Auto 1");
+static AUTO_2: [u16; 6] = wide(b"Auto 2");
+static AUTO_3: [u16; 6] = wide(b"Auto 3");
+pub static EXTRA_NAMES: [&[u16]; EXTRA] = [&QUICK, &AUTO_1, &AUTO_2, &AUTO_3];
 
 /// A card as the screen asks for it. The results are the library's: 0 is fine.
 pub trait Card {
@@ -145,6 +166,11 @@ pub trait Card {
     /// card that cannot do it refuses.
     fn remove(&mut self, _port: u8, _slot: usize) -> i32 {
         1
+    }
+    /// How many of the build's rows ([`EXTRA`]) a list of loads of the screen for a PC
+    /// shows above the slots; they are the card's slots from [`SLOTS`] on.
+    fn extra(&self) -> usize {
+        0
     }
 }
 
@@ -245,12 +271,16 @@ pub struct CardScreen {
     /// The cursor records of the states 0 to 5.
     pub cursors: [Cursor; 6],
     starts: [(i16, i16); 6],
-    /// The heads read so far and the next slot to read (+32).
+    /// The heads read so far and the next slot to read (+32): of the rows of the list,
+    /// which are the slots unless [`Self::extra`] rows stand above them.
     pub heads: Vec<[u8; HEAD]>,
     pub count: i32,
-    /// The slots that have a file, the free blocks and the saves found, as the last
+    /// The rows that have a file, the free blocks and the saves found, as the last
     /// reading of the directory left them.
-    pub filled: [bool; SLOTS],
+    pub filled: [bool; ROWS_MOST],
+    /// The build's rows above the slots in this list ([`EXTRA`]): only a list of loads of
+    /// the screen for a PC has them, so a save never goes to them.
+    pub extra: usize,
     pub free: i32,
     pub saves: i32,
     /// A game was loaded (+8).
@@ -281,9 +311,10 @@ impl CardScreen {
             word,
             cursors,
             starts,
-            heads: vec![[0; HEAD]; SLOTS],
+            heads: vec![[0; HEAD]; ROWS_MOST],
             count: 0,
-            filled: [false; SLOTS],
+            filled: [false; ROWS_MOST],
+            extra: 0,
             free: 0,
             saves: 0,
             loaded: false,
@@ -300,16 +331,28 @@ impl CardScreen {
         let mut screen = Self::open(kind, records);
         screen.shape = Shape::Plain;
         if kind != Kind::Room {
+            screen.rows_for(card);
             screen.directory(card);
             screen.state = state::SLOTS;
         }
         screen
     }
 
+    /// A list of the screen for a PC gets the build's rows above its slots when it is a
+    /// list of loads.
+    fn rows_for(&mut self, card: &dyn Card) {
+        self.extra = match self.line() {
+            line::LOAD => card.extra().min(EXTRA),
+            _ => 0,
+        };
+        self.cursors[3].lines = self.rows() as u16;
+    }
+
     /// The saves come up without a port and a check of it ([`Shape::Plain`]): the
     /// directory is read, and the heads from the first slot on.
     fn to_slots(&mut self, card: &dyn Card) {
         self.over = None;
+        self.rows_for(card);
         self.directory(card);
         self.count = 0;
         (self.cursors[3].at, self.cursors[3].first) = self.starts[3];
@@ -326,14 +369,33 @@ impl CardScreen {
         self.cursors[1].at as u8
     }
 
-    /// The slot under the cursor of the slots.
-    pub fn slot(&self) -> usize {
+    /// The row under the cursor of the slots.
+    pub fn row(&self) -> usize {
         (self.cursors[3].at + self.cursors[3].first).max(0) as usize
     }
 
-    /// Whether the head of a slot is in: the count is two above its number.
-    pub fn is_read(&self, slot: usize) -> bool {
-        (slot as i32) < self.count - 1
+    /// The card's slot of the row under the cursor.
+    pub fn slot(&self) -> usize {
+        self.slot_of(self.row())
+    }
+
+    /// The rows of the list: the slots, and the build's rows above them.
+    pub fn rows(&self) -> usize {
+        SLOTS + self.extra
+    }
+
+    /// The card's slot of a row: a row above the slots is one of the card's slots from
+    /// [`SLOTS`] on.
+    pub fn slot_of(&self, row: usize) -> usize {
+        match row.checked_sub(self.extra) {
+            Some(slot) => slot,
+            None => SLOTS + row,
+        }
+    }
+
+    /// Whether the head of a row is in: the count is two above its number.
+    pub fn is_read(&self, row: usize) -> bool {
+        (row as i32) < self.count - 1
     }
 
     /// The message on screen, as its number in the records of `0x800BE1A8`
@@ -421,24 +483,26 @@ impl CardScreen {
     /// The directory of the card (`0x800BB29C`).
     fn directory(&mut self, card: &dyn Card) {
         let port = self.port();
-        self.filled = std::array::from_fn(|slot| card.has(port, slot));
+        let rows = self.rows();
+        self.filled = std::array::from_fn(|row| row < rows && card.has(port, self.slot_of(row)));
         self.saves = self.filled.iter().filter(|filled| **filled).count() as i32;
         self.free = SLOTS as i32 - card.blocks(port);
     }
 
     /// The heads, one at a time (`0x800B9A10`): false when the card went.
     fn read_heads(&mut self, card: &mut dyn Card) -> bool {
+        let rows = self.rows() as i32;
         match self.asked() {
-            None if self.count < SLOTS as i32 => {
-                let slot = self.count as usize;
-                if self.filled[slot] {
+            None if self.count < rows => {
+                let row = self.count as usize;
+                if self.filled[row] {
                     let port = self.port();
-                    let result = match card.read(port, slot) {
+                    let result = match card.read(port, self.slot_of(row)) {
                         Ok(buffer) => {
                             let head = buffer.get(save::HEAD..save::HEAD + HEAD);
                             match head {
                                 Some(head) => {
-                                    self.heads[slot].copy_from_slice(head);
+                                    self.heads[row].copy_from_slice(head);
                                     0
                                 }
                                 None => 5,
@@ -447,8 +511,8 @@ impl CardScreen {
                         Err(result) => result,
                     };
                     self.over = Some((READ, result));
-                } else if slot == SLOTS - 1 {
-                    self.count = SLOTS as i32;
+                } else if row as i32 == rows - 1 {
+                    self.count = rows;
                 }
                 self.count += 1;
                 true
@@ -460,7 +524,7 @@ impl CardScreen {
             }
             Some((EXISTS, result)) => result == 0,
             Some((READ, 0)) => {
-                if self.count == SLOTS as i32 {
+                if self.count == rows {
                     self.count += 1;
                 }
                 true
@@ -541,9 +605,9 @@ impl CardScreen {
                 }
                 // The build's "Delete": the square on a save whose head is in.
                 if self.shape == Shape::Plain && pad.pressed & pad::SQUARE != 0 {
-                    let slot = self.slot();
-                    let filled = self.filled.get(slot).copied().unwrap_or(false);
-                    if filled && self.is_read(slot) {
+                    let row = self.row();
+                    let filled = self.filled.get(row).copied().unwrap_or(false);
+                    if filled && self.is_read(row) {
                         passed.sounds.push(SOUND_CONFIRM);
                         self.wanted = i32::from(state::DELETE);
                     } else {
@@ -554,14 +618,14 @@ impl CardScreen {
                 }
             }
             state::DELETE => {
-                let slot = self.slot();
+                let row = self.row();
                 if cancel || (confirm && self.cursors[4].at != 0) {
                     passed.sounds.push(SOUND_CANCEL);
                     self.wanted = i32::from(state::SLOTS);
                 } else if confirm {
-                    let done = card.remove(self.port(), slot) == 0;
+                    let done = card.remove(self.port(), self.slot_of(row)) == 0;
                     if done {
-                        if let Some(head) = self.heads.get_mut(slot) {
+                        if let Some(head) = self.heads.get_mut(row) {
                             *head = [0; HEAD];
                         }
                         self.directory(card);
@@ -701,10 +765,10 @@ impl CardScreen {
         if !confirm || !matches!(self.line(), line::SAVE | line::LOAD) {
             return;
         }
-        let slot = self.slot();
-        let filled = self.filled.get(slot).copied().unwrap_or(false);
+        let row = self.row();
+        let filled = self.filled.get(row).copied().unwrap_or(false);
         let mut sound = SOUND_REFUSED;
-        if self.is_read(slot) {
+        if self.is_read(row) {
             if filled || (self.line() == line::SAVE && self.free > 0) {
                 self.wanted = i32::from(state::ASK);
                 sound = SOUND_CONFIRM;
@@ -743,10 +807,10 @@ impl CardScreen {
     /// The passes of a save (`0x800B9BB0`): the buffer is written, and when that is
     /// over the head goes into the list and the slots are back.
     fn save(&mut self, card: &mut dyn Card, passed: &mut Passed) {
-        let slot = self.slot();
+        let row = self.row();
         match self.asked() {
             None => {
-                let result = card.write(self.port(), slot, &self.buffer);
+                let result = card.write(self.port(), self.slot_of(row), &self.buffer);
                 self.over = Some((WRITE, result));
             }
             Some((WRITE, 0)) => {
@@ -755,7 +819,7 @@ impl CardScreen {
                 self.wanted = i32::from(state::SLOTS);
                 passed.sounds.push(SOUND_CONFIRM);
                 let head = self.buffer.get(save::HEAD..save::HEAD + HEAD);
-                if let (Some(place), Some(head)) = (self.heads.get_mut(slot), head) {
+                if let (Some(place), Some(head)) = (self.heads.get_mut(row), head) {
                     place.copy_from_slice(head);
                 }
                 self.directory(card);
@@ -771,14 +835,14 @@ impl CardScreen {
 
     /// The passes of a load (`0x800BA520`): the file is read and handed to the reader.
     fn load(&mut self, card: &mut dyn Card, game: &mut dyn Game, passed: &mut Passed) {
-        let slot = self.slot();
+        let (row, slot) = (self.row(), self.slot());
         let failed = |screen: &mut Self| {
             screen.routine = Routine::States;
             screen.deed = deed::STATES;
             screen.wanted = i32::from(state::LOAD_FAILED);
         };
         match self.asked() {
-            None if self.filled.get(slot).copied().unwrap_or(false) => {
+            None if self.filled.get(row).copied().unwrap_or(false) => {
                 let result = match card.read(self.port(), slot) {
                     Ok(buffer) => {
                         self.buffer = buffer;
@@ -1627,5 +1691,110 @@ mod tests {
         screen.pass(&press(pad::UP), &mut card, &mut game);
         let passed = screen.pass(&press(pad::CROSS), &mut card, &mut game);
         assert_eq!((passed.sounds, screen.wanted), (vec![SOUND_CONFIRM], 4));
+    }
+
+    /// A card with the build's slots behind its fifteen: the quick save and the
+    /// autosaves.
+    struct WithExtra {
+        cards: Cards,
+        extra: [Option<Vec<u8>>; EXTRA],
+    }
+
+    impl Card for WithExtra {
+        fn blocks(&self, port: u8) -> i32 {
+            self.cards.blocks(port)
+        }
+
+        fn has(&self, port: u8, slot: usize) -> bool {
+            match slot.checked_sub(SLOTS) {
+                Some(extra) => self.extra.get(extra).is_some_and(Option::is_some),
+                None => self.cards.has(port, slot),
+            }
+        }
+
+        fn read(&mut self, port: u8, slot: usize) -> Result<Vec<u8>, i32> {
+            match slot.checked_sub(SLOTS) {
+                Some(extra) => self.extra.get(extra).cloned().flatten().ok_or(5),
+                None => self.cards.read(port, slot),
+            }
+        }
+
+        fn write(&mut self, port: u8, slot: usize, buffer: &[u8]) -> i32 {
+            match slot < SLOTS {
+                true => self.cards.write(port, slot, buffer),
+                false => 1,
+            }
+        }
+
+        fn extra(&self) -> usize {
+            EXTRA
+        }
+    }
+
+    #[test]
+    fn a_list_of_loads_has_the_quick_save_and_the_autosaves_above_the_slots() {
+        let numbered = |number: u8| {
+            let mut buffer = vec![0; BUFFER];
+            (buffer[save::HEAD], buffer[save::GAME]) = (number, number);
+            buffer
+        };
+        let mut cards = Cards::default();
+        cards.write(0, 0, &numbered(3));
+        let mut card = WithExtra {
+            cards,
+            extra: [Some(numbered(5)), None, Some(numbered(6)), None],
+        };
+        let mut game = game(1);
+        let mut screen = CardScreen::open_plain(Kind::Continue, records(), &card);
+        assert_eq!((screen.extra, screen.rows()), (EXTRA, SLOTS + EXTRA));
+        assert_eq!(screen.cursors[3].lines as usize, SLOTS + EXTRA);
+        for _ in 0..2 * (SLOTS + EXTRA) {
+            screen.pass(&Pad::default(), &mut card, &mut game);
+        }
+        // The quick save is the first row, the first of the fifteen the fifth.
+        assert_eq!(screen.saves, 3);
+        assert_eq!(
+            (
+                screen.heads[0][0],
+                screen.heads[2][0],
+                screen.heads[EXTRA][0]
+            ),
+            (5, 6, 3)
+        );
+        assert_eq!((screen.row(), screen.slot()), (0, SLOTS));
+        assert_eq!((screen.slot_of(3), screen.slot_of(EXTRA)), (SLOTS + 3, 0));
+        // Its load reads the card's slot behind the fifteen.
+        screen.pass(&press(pad::CROSS), &mut card, &mut game);
+        screen.pass(&Pad::default(), &mut card, &mut game);
+        assert_eq!((screen.state, screen.cursors[4].at), (state::ASK, 0));
+        screen.pass(&press(pad::CROSS), &mut card, &mut game);
+        for _ in 0..4 {
+            screen.pass(&Pad::default(), &mut card, &mut game);
+        }
+        assert_eq!((game.took, screen.deed), (Some(5), deed::LOADED));
+        // A room's list of saves has only the fifteen.
+        let mut screen = CardScreen::open_plain(Kind::Room, records(), &card);
+        screen.pass(&press(pad::CROSS), &mut card, &mut game);
+        screen.pass(&Pad::default(), &mut card, &mut game);
+        assert_eq!(
+            (screen.state, screen.extra, screen.rows(), screen.slot()),
+            (state::SLOTS, 0, SLOTS, 0)
+        );
+        assert_eq!(screen.cursors[3].lines as usize, SLOTS);
+        // Its "Load" has the rows above again.
+        screen.pass(&press(pad::TRIANGLE), &mut card, &mut game);
+        screen.pass(&Pad::default(), &mut card, &mut game);
+        screen.pass(&press(pad::DOWN), &mut card, &mut game);
+        screen.pass(&press(pad::CROSS), &mut card, &mut game);
+        screen.pass(&Pad::default(), &mut card, &mut game);
+        assert_eq!((screen.line(), screen.extra), (line::LOAD, EXTRA));
+    }
+
+    #[test]
+    fn the_words_of_the_build_are_wide_letters() {
+        assert_eq!(wide(b"A1:")[0], 0x8260u16.swap_bytes());
+        assert_eq!(wide(b"A1:")[1], 0x8250u16.swap_bytes());
+        assert_eq!(wide(b"A1:")[2], 0x8146u16.swap_bytes());
+        assert_eq!(EXTRA_NAMES.len(), EXTRA);
     }
 }

@@ -7,7 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arboard = { workspace = true }
 bevy = { workspace = true }
 jc-disc = { workspace = true }
 jc-formats = { workspace = true }
+jc-net = { workspace = true }
 rfd = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
