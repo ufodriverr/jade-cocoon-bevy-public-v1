@@ -28,6 +28,7 @@ fn named(seconds: i64) -> String {
 }
 
 /// The count of days since 1970-01-01 of a date (Howard Hinnant's `days_from_civil`).
+#[cfg(any(windows, test))]
 fn days(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -77,7 +78,38 @@ fn offset() -> i64 {
     (ahead as f64 / 900.0).round() as i64 * 900
 }
 
-#[cfg(not(windows))]
+/// The C library's own clock (Android's bionic): the offset of the time zone it knows.
+#[cfg(target_os = "android")]
+fn offset() -> i64 {
+    /// bionic's `struct tm`.
+    #[repr(C)]
+    struct Tm {
+        fields: [std::ffi::c_int; 9],
+        gmtoff: std::ffi::c_long,
+        zone: *const std::ffi::c_char,
+    }
+    unsafe extern "C" {
+        fn time(now: *mut i64) -> i64;
+        fn localtime_r(now: *const i64, tm: *mut Tm) -> *mut Tm;
+    }
+    let mut tm = Tm {
+        fields: [0; 9],
+        gmtoff: 0,
+        zone: std::ptr::null(),
+    };
+    // SAFETY: `time` with a null pointer only answers, and `localtime_r` fills the
+    // struct it is handed, which lives here.
+    let filled = unsafe {
+        let now = time(std::ptr::null_mut());
+        localtime_r(&now, &mut tm)
+    };
+    match filled.is_null() {
+        true => 0,
+        false => (tm.gmtoff as f64 / 900.0).round() as i64 * 900,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
 fn offset() -> i64 {
     0
 }

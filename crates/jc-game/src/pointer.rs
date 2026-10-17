@@ -212,9 +212,12 @@ pub(crate) fn read_mouse(
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time<Real>>,
     frame: Option<Res<Frame>>,
+    touch: Option<Res<crate::touch::TouchPad>>,
     mut mouse: ResMut<Mouse>,
 ) {
     let mouse = &mut *mouse;
+    // A phone's touch that is no button of the touch screen is the mouse (`touch.rs`).
+    let touched = touch.and_then(|touch| touch.pointer());
     if let Some(checked) = &mouse.checked {
         // A check run's mouse: its place, and its left button as if it were pressed.
         // With `--point-from-menu` its seconds count from the frame a screen with an
@@ -246,10 +249,12 @@ pub(crate) fn read_mouse(
         return;
     }
     // A window without the focus has no mouse, as in `keys.rs`.
-    let focused = windows.single().is_ok_and(|window| window.focused);
-    let at = (windows.single().ok())
-        .filter(|_| focused)
-        .and_then(Window::cursor_position);
+    let focused = windows.single().is_ok_and(|window| window.focused) || touched.is_some();
+    let at = touched.or_else(|| {
+        (windows.single().ok())
+            .filter(|_| focused)
+            .and_then(Window::cursor_position)
+    });
     mouse.moved = at.is_some() && at != mouse.at;
     mouse.at = at;
     mouse.clicked = at.is_some() && buttons.just_pressed(MouseButton::Left);

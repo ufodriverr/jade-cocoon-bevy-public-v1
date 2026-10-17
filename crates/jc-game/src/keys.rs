@@ -322,9 +322,14 @@ pub(crate) fn read_pad(
     (entry, merge, lobby): Typing,
     menus: Menus,
     windows: Query<&Window, With<PrimaryWindow>>,
+    touch: Option<Res<crate::touch::TouchPad>>,
     mut pad: ResMut<Pad>,
 ) {
     let pad = &mut *pad;
+    // The buttons and the stick of a phone's touch screen (`touch.rs`).
+    let touch = touch.as_deref();
+    let touch_held = touch.map_or(0, crate::touch::TouchPad::held);
+    let touch_stick = touch.and_then(crate::touch::TouchPad::stick);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
     pad.alt_enter = match keys.any_pressed(ENTER) {
         true => pad.alt_enter || (alt && keys.any_just_pressed(ENTER)),
@@ -368,13 +373,15 @@ pub(crate) fn read_pad(
         |button| pads.pressed(button),
         |button| pads.just_pressed(button),
     );
-    pad.buttons = from_pad.buttons;
-    let stick = pad.stick_held.unwrap_or(pads.stick());
+    pad.buttons = from_pad.buttons | touch_held;
+    let stick = (pad.stick_held.or(touch_stick)).unwrap_or(pads.stick());
     pad.stick_directions = gamepad::directions(stick, pad.stick_directions);
     pad.stick = gamepad::live(stick);
     pad.run = from_keys.run || from_pad.run;
-    pad.menu = from_keys.menu || from_pad.menu;
-    pad.fast_forward = from_keys.fast_forward || from_pad.fast_forward;
+    pad.menu = from_keys.menu || from_pad.menu || touch.is_some_and(|touch| touch.menu_key());
+    pad.fast_forward = from_keys.fast_forward
+        || from_pad.fast_forward
+        || touch.is_some_and(|touch| touch.fast_forward());
     // Caps Lock on the name entry is the typing's, for capitals: no turn of the run.
     if pad.run_toggle && !naming && (from_keys.toggle || from_pad.toggle) {
         pad.toggled = !pad.toggled;

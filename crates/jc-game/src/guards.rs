@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
-use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use crate::saving::PlayClock;
 
@@ -85,13 +84,7 @@ impl Asking {
         let answer = Arc::new(OnceLock::new());
         let given = answer.clone();
         std::thread::spawn(move || {
-            let said = MessageDialog::new()
-                .set_title("Jade Cocoon")
-                .set_level(MessageLevel::Warning)
-                .set_description(question)
-                .set_buttons(MessageButtons::YesNo)
-                .show();
-            let _ = given.set(said == MessageDialogResult::Yes);
+            let _ = given.set(crate::dialog::ask_yes_no(question));
         });
         self.0 = Some((answer, then));
     }

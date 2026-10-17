@@ -1,3 +1,42 @@
+# Version 1.1.1
+
+Prepared 2026-10-17. The Android update: the same game as 1.1.0, now also as an APK for
+arm64 Android phones.
+
+## Android
+
+- An APK for arm64 phones (Android 9 or later; developed on a Galaxy S24 with Android 16).
+- The first start asks for your own disc image with the system's file picker, copies it
+  into the app's folder once and checks it; if the game cannot read it, the screen comes
+  back with the reason. Later starts go straight to the game.
+- **Touch controls**, drawn beside the 4:3 picture: an analog stick (a light push walks,
+  a firm one runs), cross, circle, triangle and square (a thumb can slide between them),
+  L1, L2, R1, R2, Select, Start, a menu button and a fast-forward toggle. A tap anywhere
+  else works like the PC's mouse: tap a menu row to pick it, or confirm in a room. The
+  back gesture is triangle. A short vibration ticks under the thumb.
+- Gamepads work as on Windows; the on-screen buttons hide while one is used.
+- The help lines show the PlayStation signs on a phone.
+- The game folder is `Android/data/io.github.ufodriverr.jadecocoon/files`: saves,
+  settings and logs are the same files as on Windows, so a save can be copied between
+  the PC and the phone over USB. Uninstalling the app deletes that folder.
+- The game pauses while the app is in the background and the screen stays on while it
+  plays. Arena Battle works between a phone and a PC that both run 1.1.1; "Paste" takes a
+  room code from the phone's clipboard.
+- The APK carries the licence and the notices (`assets/legal`) and names the source on
+  its first screen.
+
+## Notes for 1.1.1
+
+- Windows: the game is unchanged from 1.1.0; the new Windows ZIP is built from the same
+  commit as the APK, so the two can play Arena Battle together (two builds of different
+  commits refuse each other). `--touch-controls` shows the touch buttons on a PC.
+- The APK is signed with the project's own release key. A test build signed with another
+  key does not install over it: copy `saves` off the phone, uninstall, then install.
+- The Android build adds no Rust dependencies; the APK includes the AndroidX libraries
+  and GameActivity (Apache-2.0), listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+- Tried on a Galaxy S24 and the Android emulator only. Older phones and phones without
+  Vulkan are untested.
+
 # Version 1.1.0
 
 Second public release, prepared 2026-10-16. Free, unofficial, noncommercial fan project.

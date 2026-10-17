@@ -1160,9 +1160,7 @@ impl Lobby {
                 println!("versus: the room code {code} is copied (a check leaves the clipboard)");
                 Ok(())
             }
-            false => {
-                arboard::Clipboard::new().and_then(|mut board| board.set_text(code.to_string()))
-            }
+            false => crate::clipboard::set(&code.to_string()),
         };
         self.form.note = Some(match said {
             Ok(()) => "Copied: paste it into the chat.".into(),
@@ -1180,9 +1178,7 @@ impl Lobby {
             true => crate::versus_check::code_file(&self.args)
                 .and_then(|file| std::fs::read_to_string(file).ok())
                 .ok_or_else(|| "a check has no code yet".to_string()),
-            false => arboard::Clipboard::new()
-                .and_then(|mut board| board.get_text())
-                .map_err(|err| err.to_string()),
+            false => crate::clipboard::get(),
         };
         match text {
             Ok(text) if !text.trim().is_empty() => {

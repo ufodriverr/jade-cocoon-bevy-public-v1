@@ -1,9 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["crates/jc-disc", "crates/jc-formats", "crates/jc-game", "crates/jc-net"]
+members = [
+    "crates/jc-android",
+    "crates/jc-disc",
+    "crates/jc-formats",
+    "crates/jc-game",
+    "crates/jc-net",
+]
+# The Android library is built by `android/build-apk.ps1` only.
+default-members = ["crates/jc-disc", "crates/jc-formats", "crates/jc-game", "crates/jc-net"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
 publish = false
@@ -36,6 +44,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# The native library of the APK (`android/build-apk.ps1`): a release without its debug
+# info, which Gradle would otherwise pack (the names stay, for a crash's backtrace).
+[profile.android]
+inherits = "release"
+strip = "debuginfo"
 
 [profile.release]
 # Avoid embedding local developer paths in debug information.

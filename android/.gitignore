@@ -1,0 +1,8 @@
+# Machine-specific: the path of the Android SDK.
+/local.properties
+# Gradle's and the build's output, and the native library cargo-ndk builds.
+/.gradle/
+/build/
+/app/build/
+/jniLibs/
+/.kotlin/

@@ -67,12 +67,7 @@ fn crash_note(info: &std::panic::PanicHookInfo<'_>) {
             ),
             Err(err) => format!("Jade Cocoon stopped with an error:\n\n{info}\n\n({err})"),
         };
-        rfd::MessageDialog::new()
-            .set_title("Jade Cocoon")
-            .set_level(rfd::MessageLevel::Error)
-            .set_description(said)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+        crate::dialog::tell_error(&said);
     }
 }
 

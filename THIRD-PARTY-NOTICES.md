@@ -24,6 +24,71 @@ data under the Community Data License Agreement Permissive 2.0, whose text is ke
 with them. `attohttpc` (MPL-2.0) is used for router port forwarding; its source is in
 the complete source archive.
 
+## The Android APK (version 1.1.1)
+
+The APK adds no Rust package to the list below; its native library links the same
+Cargo packages for the Android target (among them `android-activity`, which carries
+the GameActivity C glue of the Android Open Source Project under Apache-2.0). The APK
+also contains these Java/Kotlin libraries from Google's Maven repository and Maven
+Central, each declared Apache-2.0 by its published POM. The Apache License 2.0 text is
+in [licenses/android-apk](licenses/android-apk). The Gradle wrapper in `android/gradle/`
+(Gradle, Apache-2.0) is part of the source only. The APK carries this file, the licence
+and `licenses/` in `assets/legal`.
+
+| Group | Artifact | Version | Declared licence |
+|---|---|---|---|
+| androidx.activity | activity | 1.8.0 | Apache-2.0 |
+| androidx.annotation | annotation-experimental | 1.4.1 | Apache-2.0 |
+| androidx.annotation | annotation-jvm | 1.8.1 | Apache-2.0 |
+| androidx.annotation | annotation | 1.8.1 | Apache-2.0 |
+| androidx.appcompat | appcompat-resources | 1.7.1 | Apache-2.0 |
+| androidx.appcompat | appcompat | 1.7.1 | Apache-2.0 |
+| androidx.arch.core | core-common | 2.2.0 | Apache-2.0 |
+| androidx.arch.core | core-runtime | 2.2.0 | Apache-2.0 |
+| androidx.collection | collection-jvm | 1.4.2 | Apache-2.0 |
+| androidx.collection | collection | 1.4.2 | Apache-2.0 |
+| androidx.concurrent | concurrent-futures | 1.1.0 | Apache-2.0 |
+| androidx.core | core-ktx | 1.16.0 | Apache-2.0 |
+| androidx.core | core-viewtree | 1.0.0 | Apache-2.0 |
+| androidx.core | core | 1.16.0 | Apache-2.0 |
+| androidx.cursoradapter | cursoradapter | 1.0.0 | Apache-2.0 |
+| androidx.customview | customview | 1.0.0 | Apache-2.0 |
+| androidx.drawerlayout | drawerlayout | 1.0.0 | Apache-2.0 |
+| androidx.emoji2 | emoji2-views-helper | 1.3.0 | Apache-2.0 |
+| androidx.emoji2 | emoji2 | 1.3.0 | Apache-2.0 |
+| androidx.fragment | fragment | 1.5.4 | Apache-2.0 |
+| androidx.games | games-activity | 4.4.0 | Apache-2.0 |
+| androidx.interpolator | interpolator | 1.0.0 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-common | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-livedata-core | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-livedata | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-process | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-runtime | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-viewmodel-savedstate | 2.6.2 | Apache-2.0 |
+| androidx.lifecycle | lifecycle-viewmodel | 2.6.2 | Apache-2.0 |
+| androidx.loader | loader | 1.0.0 | Apache-2.0 |
+| androidx.profileinstaller | profileinstaller | 1.3.1 | Apache-2.0 |
+| androidx.resourceinspection | resourceinspection-annotation | 1.0.1 | Apache-2.0 |
+| androidx.savedstate | savedstate | 1.2.1 | Apache-2.0 |
+| androidx.startup | startup-runtime | 1.1.1 | Apache-2.0 |
+| androidx.tracing | tracing | 1.2.0 | Apache-2.0 |
+| androidx.vectordrawable | vectordrawable-animated | 1.1.0 | Apache-2.0 |
+| androidx.vectordrawable | vectordrawable | 1.1.0 | Apache-2.0 |
+| androidx.versionedparcelable | versionedparcelable | 1.1.1 | Apache-2.0 |
+| androidx.viewpager | viewpager | 1.0.0 | Apache-2.0 |
+| com.google.guava | listenablefuture | 1.0 | Apache-2.0 |
+| org.jetbrains.kotlin | kotlin-stdlib-common | 2.2.10 | Apache-2.0 |
+| org.jetbrains.kotlin | kotlin-stdlib-jdk7 | 1.8.0 | Apache-2.0 |
+| org.jetbrains.kotlin | kotlin-stdlib-jdk8 | 1.8.0 | Apache-2.0 |
+| org.jetbrains.kotlin | kotlin-stdlib | 2.2.10 | Apache-2.0 |
+| org.jetbrains.kotlinx | kotlinx-coroutines-android | 1.6.4 | Apache-2.0 |
+| org.jetbrains.kotlinx | kotlinx-coroutines-core-jvm | 1.6.4 | Apache-2.0 |
+| org.jetbrains.kotlinx | kotlinx-coroutines-core | 1.6.4 | Apache-2.0 |
+| org.jetbrains | annotations | 13.0 | Apache-2.0 |
+| org.jspecify | jspecify | 1.0.0 | Apache-2.0 |
+
+## Cargo packages
+
 | Package | Version | Declared licence | Notices |
 |---|---|---|---|
 | ab_glyph | 0.2.32 | Apache-2.0 | [Files](licenses/ab_glyph-0.2.32) |

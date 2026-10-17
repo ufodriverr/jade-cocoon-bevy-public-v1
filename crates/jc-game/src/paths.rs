@@ -12,11 +12,15 @@ pub const LOGS: &str = "logs";
 /// (`skip.rs`): the machine's, no save keeps it.
 pub const SEEN: &str = "seen.toml";
 
-/// The game folder, found once.
+/// The game folder, found once. A phone's is the app's own folder, the working folder
+/// that `android.rs` sets (its exe is Android's own).
 pub fn game_folder() -> &'static Path {
     static FOLDER: OnceLock<PathBuf> = OnceLock::new();
     FOLDER.get_or_init(|| {
         let working = std::env::current_dir().unwrap_or_default();
+        if cfg!(target_os = "android") {
+            return working;
+        }
         let exe = std::env::current_exe().ok();
         folder_of(exe.as_deref(), &working)
     })

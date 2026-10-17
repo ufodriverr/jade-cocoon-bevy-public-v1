@@ -1,0 +1,32 @@
+[package]
+name = "jc-android"
+description = "Jade Cocoon on Bevy for Android: the game of jc-game as the native library of an APK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The game's own source, built as the library the APK loads (`android/`). The modules of
+# `jc-game/src` stay where they are; only the target differs, so a build for a PC never
+# compiles this crate (it is not a default member of the workspace).
+[lib]
+name = "jadecocoon"
+path = "../jc-game/src/main.rs"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+bevy = { workspace = true, features = ["android-game-activity"] }
+jc-disc = { workspace = true }
+jc-formats = { workspace = true }
+jc-net = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+jni = "0.21"
+
+# The game's PC dialogs and clipboard, so that the whole workspace also builds and tests
+# on a PC (`cargo test --workspace`); the Android build never links them.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
+rfd = { workspace = true }

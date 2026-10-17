@@ -1035,6 +1035,16 @@ fn fit_cameras(frame: Option<ResMut<Frame>>, mut cameras: ScreenCameras, mut com
 /// The primary window as a run starts it: a play session's from `[display]`, in
 /// physical pixels (`exact`); a check's hidden and at the size it always had.
 pub fn window(display: &prefs::Display, hidden: bool, exact: bool) -> Window {
+    // A phone's window is its whole screen, at the size Android gives it, counted in
+    // physical pixels as a play session's window on a PC is.
+    if cfg!(target_os = "android") {
+        return Window {
+            title: "Jade Cocoon".into(),
+            resolution: WindowResolution::default().with_scale_factor_override(1.0),
+            present_mode: present_mode(display.vsync),
+            ..default()
+        };
+    }
     let size = display.window_size.unwrap_or(display.resolution);
     let mut resolution = WindowResolution::new(size.width, size.height);
     if exact {

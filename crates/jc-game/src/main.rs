@@ -29,12 +29,16 @@ use jc_formats::tim;
 use jc_formats::vram::Vram;
 
 mod actors;
+#[cfg(target_os = "android")]
+mod android;
 mod assist;
 mod audio;
 mod before;
 mod bindings;
 mod card_view;
 mod chapter;
+mod clipboard;
+mod dialog;
 mod disc_prompt;
 mod display;
 mod duel_check;
@@ -77,6 +81,7 @@ mod skip;
 mod smooth;
 mod text_view;
 mod title;
+mod touch;
 mod versus_check;
 mod versus_view;
 mod voices;
@@ -374,6 +379,19 @@ fn parse_show_list(value: &str) -> Option<(usize, Option<u32>)> {
 fn parse_scroll(value: &str) -> Option<IVec2> {
     let (x, y) = value.split_once(',')?;
     Some(IVec2::new(x.parse().ok()?, y.parse().ok()?))
+}
+
+/// The game, from the library of `crates/jc-android` built on a PC (`cargo test
+/// --workspace` builds every member): what the exe's `main` runs. A phone starts at
+/// `android::android_main`.
+#[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn jade_cocoon_run() -> i32 {
+    match main() {
+        AppExit::Success => 0,
+        AppExit::Error(code) => i32::from(code.get()),
+    }
 }
 
 fn main() -> AppExit {
@@ -692,8 +710,9 @@ fn main() -> AppExit {
         pointer::PointerPlugin,
         name_entry::TypingPlugin,
         // The window of a check stays as it is made.
+        // A phone's window is the whole screen, which Android sizes (`android.rs`).
         display::DisplayPlugin {
-            manages_the_window: !hidden,
+            manages_the_window: !hidden && !cfg!(target_os = "android"),
         },
         widescreen::WidescreenPlugin,
         // F1 and F2 only where there are keys.
@@ -706,6 +725,10 @@ fn main() -> AppExit {
         // The confirm button over the hero where a press would do something.
         hint::HintPlugin,
     ))
+    // A phone's touch screen as the pad (`--touch-controls` shows it on a PC).
+    .add_plugins(touch::TouchPlugin {
+        shown: cfg!(target_os = "android") || args.iter().any(|arg| arg == "--touch-controls"),
+    })
     // The PC Settings of the options screen; `--pc-key=NAME` is a check's key.
     .add_plugins(pc_settings::PcSettingsPlugin {
         key_of_a_check: (args.iter())

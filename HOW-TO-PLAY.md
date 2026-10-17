@@ -1,8 +1,9 @@
-# How to play version 1.1.0
+# How to play version 1.1.1
 
-This Windows x64 fan implementation supports the European PlayStation release of
-Jade Cocoon: Story of the Tamamayu (`SLES-02201`). You must lawfully possess an original
-copy and have the right to make and use your own image. Game files are not supplied.
+This fan implementation for Windows x64 and Android (arm64) supports the European
+PlayStation release of Jade Cocoon: Story of the Tamamayu (`SLES-02201`). You must
+lawfully possess an original copy and have the right to make and use your own image.
+Game files are not supplied. On a phone, start with [Android](#android).
 See [LEGAL.md](LEGAL.md).
 
 ## Start
@@ -126,13 +127,49 @@ The game folder is the folder of `jc-game.exe`. It holds:
 - `logs\`: `jc-game.log` for this start, `jc-game.prev.log` for the one before, and a
   `crash-<date>_<time>.txt` note if the game stops with an error.
 
+## Android
+
+The Android build (an arm64 phone, Android 9 or later) is the same game. Install the
+release's `.apk`, copy your own `.bin` image to the phone, start **Jade Cocoon** and tap
+**Choose disc image (.bin)**: the system's file picker opens, and the chosen image is
+copied once (about 650 MB) into the game folder and checked. Later starts go straight
+to the game. If the game cannot read the image, this screen comes back with the reason.
+
+Buttons are drawn on the screen, beside the 4:3 picture on a wide phone:
+
+| On screen | The pad |
+|---|---|
+| Stick, bottom left: put the thumb down anywhere there | Directions: a light push walks, a firm one runs; directions in menus |
+| Cross, circle, triangle, square, bottom right | The same buttons (a thumb can slide from one to the next) |
+| L1, L2, R1, R2, top corners | The shoulder buttons |
+| SEL, START | Select and Start (hold START to skip a scene you have seen) |
+| MENU | The menu over a room, and back out of it |
+| `>>` | Fast forward on, and off with the next tap |
+| A tap anywhere else | The PC's left mouse button: tap a menu row to pick it, a tap in a room is the cross |
+| The phone's back gesture | Triangle |
+
+A Bluetooth or USB gamepad works as on the PC; the on-screen buttons hide while it is
+used and come back with the next touch. The help lines show the PlayStation signs
+(`[prompts] style` in `settings.toml` changes it). The game pauses while the app is in
+the background and goes on where it was when you come back.
+
+The game folder is `Android/data/io.github.ufodriverr.jadecocoon/files`, with the same
+files as on Windows plus the copy of the disc (`disc.bin`). Connect the phone to a PC by
+USB (file transfer) to copy `saves` both ways: saves are the same files on both.
+Uninstalling the app deletes this folder, saves included. The PC Settings' display
+page has no effect on a phone, whose screen Android sizes.
+
+In Arena Battle, "Paste" takes a room code from the phone's clipboard, and an address is
+typed on the keypad under its field. A phone and a PC play together when both run the
+same version.
+
 ## Save and load
 
 The PC save screen has fifteen places. Continue on the title opens the save list; it
 also shows the quick save and the three autosaves at the top, and the date, time and
 chapter of the save under the cursor. In a room, face the save light and press confirm
 to save or load. Deleting a save moves it to `saves\deleted\`. Back up your saves
-yourself before upgrading or experimenting. Saves from version 1.0.0 load in 1.1.0.
+yourself before upgrading or experimenting. Saves from version 1.0.0 load in 1.1.0 and 1.1.1.
 Original PlayStation memory-card import is not promised.
 
 ## Arena Battle (two players)

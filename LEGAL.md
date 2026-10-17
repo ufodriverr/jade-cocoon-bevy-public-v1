@@ -17,6 +17,10 @@ It does not execute the original PlayStation native machine code. Locally produc
 screenshots, extracted content and other game-derived outputs are not licensed by
 this project and are excluded from its distributions.
 
+On Android, the app copies the disc image you choose into its own folder on your
+device (`Android/data/io.github.ufodriverr.jadecocoon/files/disc.bin`) so the game can
+read it. The copy never leaves your device through the app and is deleted with the app.
+
 ## A lawful original copy is required
 
 You must lawfully possess an original copy of the supported game and have the right
@@ -107,10 +111,15 @@ after you choose to host or join a match. The rest of the game works offline.
   the router for a port mapping (UPnP, PCP or NAT-PMP) to help the direct connection.
 - **No accounts, no telemetry.** There are no accounts or sign-ins. The project does not
   collect, send or sell usage data, and it runs no servers of its own. Your settings,
-  saves and logs stay on your PC.
+  saves and logs stay on your PC or phone.
 
 Windows may ask whether `jc-game` may use the network the first time you host or join.
 Allowing it for **Private networks** is enough for play at home.
+
+The Android app declares the permissions Arena Battle needs (internet access, the
+network and Wi-Fi state, and Wi-Fi multicast for finding hosts on the same network) and
+vibration for the on-screen buttons. Android grants these at install without asking; the
+app asks for no other permission, and reads only the one file you pick.
 
 ## Scope of this notice
 

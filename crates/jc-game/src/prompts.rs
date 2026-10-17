@@ -43,6 +43,9 @@ impl Style {
             Style::Xbox => Shown::Xbox,
             Style::Auto => match device.last {
                 Device::Gamepad if device.pad_connected => Shown::Xbox,
+                // A phone's buttons are the touch screen's, which bear the game's own
+                // signs (`touch.rs`).
+                _ if cfg!(target_os = "android") => Shown::PlayStation,
                 _ => Shown::Keyboard,
             },
         }

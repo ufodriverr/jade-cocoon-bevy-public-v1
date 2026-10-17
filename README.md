@@ -11,14 +11,26 @@ The application reads game content from that local image. It reads data tables f
 the executable and interprets the disc's scene scripts; it does not execute the
 original PlayStation native machine code. See [LEGAL.md](LEGAL.md).
 
-## Version 1.1.0
+## Version 1.1.1
 
 The story plays through its ending, with battles, creature capture and merging, menus,
 movies, music, voices, and local save/load. The optional second-round corridor is
 implemented. Version 1.1 adds a large set of PC improvements and the two-player
-**Arena Battle** over a network or the internet. This is a fan implementation with
-known differences and bugs, rather than a promise of complete accuracy. See
-[HOW-TO-PLAY.md](HOW-TO-PLAY.md) and the [release notes](RELEASE-NOTES.md).
+**Arena Battle** over a network or the internet. Version 1.1.1 adds an **Android** build
+for arm64 phones, with on-screen touch controls; the game is otherwise the same as
+1.1.0. This is a fan implementation with known differences and bugs, rather than a
+promise of complete accuracy. See [HOW-TO-PLAY.md](HOW-TO-PLAY.md) and the
+[release notes](RELEASE-NOTES.md).
+
+### What's new in 1.1.1
+
+- **Android:** the same game as an APK for arm64 phones (Android 9 or later). The first
+  start asks for your disc image with the system's file picker and copies it into the
+  app's folder once. On-screen buttons sit beside the 4:3 picture: an analog stick, the
+  four PlayStation buttons, the shoulders, Start, Select, the menu and fast forward; a tap
+  elsewhere picks a menu row or confirms, like the PC's mouse. Gamepads work too.
+- Saves are the same files on both: copy `saves` between the PC and the phone by USB.
+- Arena Battle works between a phone and a PC when both run 1.1.1.
 
 ### What's new in 1.1
 
@@ -57,7 +69,20 @@ Do not use a disc image downloaded from somebody else merely because you own a d
 Only make and use an image where permitted by applicable law. This project does not
 provide game files or links to obtain them.
 
-Arena Battle connects your PC to another player's PC. Read
+## Play on Android
+
+Copy the release's `.apk` to the phone and open it; Android asks once to allow installs
+from that app (your file manager or browser). Copy your own `.bin` image to the phone as
+well (Downloads is fine). On first start, tap **Choose disc image (.bin)** and pick it in
+the system's file picker: it is copied once into the game folder and checked, and later
+starts go straight to the game. The `.bin` you copied can then be deleted.
+
+The game folder is `Android/data/io.github.ufodriverr.jadecocoon/files` on the phone's
+storage, with `saves`, `settings.toml` and `logs` as on Windows; a PC reaches it over USB.
+Uninstalling the app deletes that folder, saves included, so copy `saves` off first. The
+controls are in [HOW-TO-PLAY.md](HOW-TO-PLAY.md#android).
+
+Arena Battle connects your device to another player's device. Read
 [LEGAL.md](LEGAL.md#network-and-privacy) for what that means for your privacy.
 
 ## Build from source
@@ -78,7 +103,7 @@ cargo test --locked --workspace
 
 The source release does not require or contain any original game files. Only running
 the application requires your separately obtained lawful game copy. Build information
-and third-party notices are in [BUILDING.md](BUILDING.md) and
+(including the Android APK) and third-party notices are in [BUILDING.md](BUILDING.md) and
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Licence and affiliation
