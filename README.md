@@ -11,11 +11,12 @@ The application reads game content from that local image. It reads data tables f
 the executable and interprets the disc's scene scripts; it does not execute the
 original PlayStation native machine code. See [LEGAL.md](LEGAL.md).
 
-## Version 1.0.0
+## Version 1.0.1
 
-The first public release includes the story through its ending, battles, creature
-capture and merging, menus, movies, music, voices, and local save/load. The optional
-second-round corridor is implemented. This is a fan implementation with known
+The story plays through its ending, with battles, creature capture and merging, menus,
+movies, music, voices, and local save/load. The optional second-round corridor is
+implemented. Version 1.0.1 is a bug-fix update of 1.0.0: purifying gives the empty
+cocoons back again, as in the original game. This is a fan implementation with known
 differences and bugs, rather than a promise of complete accuracy. See
 [HOW-TO-PLAY.md](HOW-TO-PLAY.md) and [release notes](RELEASE-NOTES.md).
 

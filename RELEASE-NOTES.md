@@ -1,3 +1,17 @@
+# Version 1.0.1
+
+Prepared 2026-10-18. A bug fix reported by players, on top of 1.0.0.
+
+- Purifying (the screen where caught cocoons are spun or merged) gives the empty
+  cocoons back again. Each time that screen opens, the player has twelve empty
+  cocoons again, as in the original game. Before, the cocoons spent on captures
+  never came back.
+- Existing saves work unchanged. A save with no empty cocoons gets them back on the
+  next visit to that screen.
+- Version 1.1.2 (PC quality-of-life improvements, Arena Battle and Android) has the
+  same fix.
+- Otherwise the same as 1.0.0: Windows x64, the same dependencies and notices.
+
 # Version 1.0.0
 
 First public release, prepared 2026-10-14. Free, unofficial, noncommercial fan project.

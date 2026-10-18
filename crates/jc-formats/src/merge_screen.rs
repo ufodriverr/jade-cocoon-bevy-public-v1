@@ -429,12 +429,18 @@ fn whole(record: &mut Record) {
 impl MergeScreen {
     /// The screen as its set-up leaves it (`0x800BB318`): the player, the caught
     /// creatures and the carried ones are made whole, the list is opened, which
-    /// empties the game's own records, and the main menu is up.
+    /// empties the game's own records, the cocoons are filled again, and the main
+    /// menu is up.
     pub fn open(argument: i16, game: &mut Carried) -> Self {
         game.make_whole();
         game.caught.each_mut().for_each(whole);
         game.creatures.carried_mut().for_each(whole);
         let listed = Listed::open(&mut game.creatures, &mut game.caught);
+        // The set-up's last calls (`0x800BB534`, `0x800BB53C`): what is left of twelve
+        // after the empty cocoons and the records in use is given as empty cocoons.
+        // The list has just emptied the records, so the player has twelve again.
+        let in_use = game.creatures.count(0) as i32;
+        game.keeping.give_cocoons(game.keeping.cocoons_left(in_use));
         let mut cursor = Cursor {
             columns: 0,
             rows: 0,
@@ -1581,6 +1587,17 @@ mod tests {
             (0, 0)
         );
         assert_eq!((screen.state, screen.said), (state::MAIN, Said::Row(0)));
+    }
+
+    #[test]
+    fn the_set_up_fills_the_cocoons_again() {
+        // Twelve cocoons of a new game, three of them thrown in fights and two caught.
+        let mut game = game(&[5], &[6, 7]);
+        assert!(game.keeping.give_cocoons(12));
+        assert!(game.keeping.take_cocoons(3));
+        MergeScreen::open(4, &mut game);
+        assert_eq!(game.keeping.cocoons(), items::MOST_COCOONS);
+        assert_eq!(game.caught.waiting().count(), 0);
     }
 
     #[test]

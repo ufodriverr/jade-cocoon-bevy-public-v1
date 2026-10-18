@@ -1,4 +1,4 @@
-# How to play version 1.0.0
+# How to play version 1.0.1
 
 This Windows x64 fan implementation supports the European PlayStation release of
 Jade Cocoon: Story of the Tamamayu (`SLES-02201`). You must lawfully possess an original

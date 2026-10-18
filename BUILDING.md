@@ -2,7 +2,7 @@
 
 The supported build is Windows x64 (`x86_64-pc-windows-msvc`). Install Rust stable
 and the Visual Studio Desktop development with C++ workload with the Windows SDK.
-The prepared v1.0.0 build uses rustc/cargo 1.99.0. `Cargo.lock` pins dependency versions.
+The prepared v1.0.1 build uses rustc/cargo 1.99.0. `Cargo.lock` pins dependency versions.
 `build-release.ps1` applies the release build's source-path remapping so a local user
 profile does not appear in compiled source-location strings. Run it from PowerShell:
 
