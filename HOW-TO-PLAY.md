@@ -1,4 +1,4 @@
-# How to play version 1.1.1
+# How to play version 1.1.2
 
 This fan implementation for Windows x64 and Android (arm64) supports the European
 PlayStation release of Jade Cocoon: Story of the Tamamayu (`SLES-02201`). You must
@@ -169,7 +169,7 @@ The PC save screen has fifteen places. Continue on the title opens the save list
 also shows the quick save and the three autosaves at the top, and the date, time and
 chapter of the save under the cursor. In a room, face the save light and press confirm
 to save or load. Deleting a save moves it to `saves\deleted\`. Back up your saves
-yourself before upgrading or experimenting. Saves from version 1.0.0 load in 1.1.0 and 1.1.1.
+yourself before upgrading or experimenting. Saves from version 1.0.0 load in 1.1.0, 1.1.1 and 1.1.2.
 Original PlayStation memory-card import is not promised.
 
 ## Arena Battle (two players)

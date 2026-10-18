@@ -1,3 +1,23 @@
+# Version 1.1.2
+
+Prepared 2026-10-18. A bug fix reported by players, for Windows and Android.
+
+## Fixed
+
+- Purifying (the screen where caught cocoons are spun or merged) gives the empty
+  cocoons back again. Each time that screen opens, the player has twelve empty cocoons,
+  as in the original game. Before, the cocoons spent on captures never came back.
+
+## Notes for 1.1.2
+
+- Existing saves work unchanged. A save with no empty cocoons gets them back on the
+  next visit to the purifying screen.
+- Arena Battle: as before, builds of different versions or commits refuse each other,
+  so both players need 1.1.2 (the Windows ZIP and the APK of this release play
+  together).
+- No other change: the same game as 1.1.1, with the same dependencies and the same
+  release key for the APK, so it installs over 1.1.1 on a phone and keeps the saves.
+
 # Version 1.1.1
 
 Prepared 2026-10-17. The Android update: the same game as 1.1.0, now also as an APK for

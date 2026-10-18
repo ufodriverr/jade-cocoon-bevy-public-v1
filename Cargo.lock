@@ -4053,7 +4053,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jc-android"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "arboard",
  "bevy",
@@ -4068,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "jc-disc"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4077,7 +4077,7 @@ dependencies = [
 
 [[package]]
 name = "jc-formats"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "jc-disc",
  "png",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "jc-game"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "arboard",
  "bevy",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "jc-net"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "blake3",
  "crossbeam-channel",

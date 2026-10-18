@@ -11,16 +11,24 @@ The application reads game content from that local image. It reads data tables f
 the executable and interprets the disc's scene scripts; it does not execute the
 original PlayStation native machine code. See [LEGAL.md](LEGAL.md).
 
-## Version 1.1.1
+## Version 1.1.2
 
 The story plays through its ending, with battles, creature capture and merging, menus,
 movies, music, voices, and local save/load. The optional second-round corridor is
 implemented. Version 1.1 adds a large set of PC improvements and the two-player
 **Arena Battle** over a network or the internet. Version 1.1.1 adds an **Android** build
 for arm64 phones, with on-screen touch controls; the game is otherwise the same as
-1.1.0. This is a fan implementation with known differences and bugs, rather than a
-promise of complete accuracy. See [HOW-TO-PLAY.md](HOW-TO-PLAY.md) and the
-[release notes](RELEASE-NOTES.md).
+1.1.0. Version 1.1.2 fixes the empty cocoons of the purifying screen. This is a fan
+implementation with known differences and bugs, rather than a promise of complete
+accuracy. See [HOW-TO-PLAY.md](HOW-TO-PLAY.md) and the [release notes](RELEASE-NOTES.md).
+
+### What's new in 1.1.2
+
+- **Fixed:** purifying (the screen where caught cocoons are spun or merged) gives the
+  empty cocoons back: each time it opens you have twelve again, as in the original game.
+  Before, the cocoons spent on captures never came back. Existing saves work unchanged;
+  a save with no empty cocoons gets them back on the next visit.
+- Arena Battle needs the same version on both sides: both players need 1.1.2.
 
 ### What's new in 1.1.1
 

@@ -347,10 +347,13 @@ impl MergeView {
             high: side,
         });
         let waited = carried.caught.waiting().count();
+        let empties = carried.keeping.cocoons();
         let screen = MergeScreen::open(argument, &mut carried);
         info!(
             "the screen of the caught: argument {argument}; {waited} caught creatures are his \
-             own now, everybody is made whole; the list (place, state, species, level) {:?}",
+             own now, everybody is made whole, the empty cocoons {empties} -> {}; the list \
+             (place, state, species, level) {:?}",
+            carried.keeping.cocoons(),
             listed(&screen.listed)
         );
         Ok(Self {
