@@ -1,0 +1,16 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Jade Cocoon: Story of the Tamamayu",
+  "wikidata": "Q1477100",
+  "system": "PS1",
+  "type": "port",
+  "original": { "region": "Europe", "serial": "SLES-02201" },
+  "project": "Jade Cocoon on Bevy",
+  "status": "released",
+  "targets": ["Windows", "Android"],
+  "approach": "Engine reimplementation in Rust on Bevy: reads the game's data tables and interprets its scene scripts, no native code run",
+  "maintainers": [{ "name": "ufodriverr", "link": "https://github.com/ufodriverr" }],
+  "links": [{ "label": "Releases", "url": "https://github.com/ufodriverr/jade-cocoon-bevy-public-v1/releases" }],
+  "tags": ["rust", "bevy", "reimplementation", "multiplayer", "android"],
+  "notes": "The story plays through its ending: battles, capture and merging, menus, movies, music, voices, saves and the second-round corridor. 1.1 adds PC options (widescreen, gamepads, rebinding, fast-forward, quick saves) and a two-player Arena Battle over LAN or the internet; 1.1.1 adds an Android build. Never runs the original PlayStation machine code. Game files are not included: you need your own original copy of the European release."
+}
