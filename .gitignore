@@ -37,3 +37,5 @@ SCES_*
 SCUS_*
 *.stackdump
 __pycache__/
+/android
+/jade-cocoon-releases
