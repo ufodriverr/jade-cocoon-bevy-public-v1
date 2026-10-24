@@ -43,3 +43,4 @@ SCES_*
 SCUS_*
 *.stackdump
 __pycache__/
+/jade-cocoon-releases
